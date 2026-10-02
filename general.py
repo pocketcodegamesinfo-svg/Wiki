@@ -3,6 +3,7 @@ import os
 import html
 import secrets
 import hashlib
+from datetime import datetime, timedelta
 from functools import wraps
 from flask import (Flask, request, session, redirect, url_for,
                    render_template_string, g, abort, send_from_directory, flash)
@@ -13,6 +14,7 @@ DB_PATH = "wiki.db"
 UPLOAD_DIR = "uploads"
 ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 MAX_AVATAR_BYTES = 2 * 1024 * 1024
+ONLINE_TIMEOUT_SEC = 300  # 5 минут — считаем «онлайн»
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -55,9 +57,12 @@ def init_db():
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             avatar TEXT DEFAULT '',
+            bio TEXT DEFAULT '',
+            status TEXT DEFAULT '',
             is_owner INTEGER DEFAULT 0,
             role_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS pages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +77,14 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             author TEXT NOT NULL,
             body TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS private_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            body TEXT NOT NULL,
+            is_read INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS invites (
@@ -104,13 +117,17 @@ def migrate_db():
         uc = cols("users")
         for name, ddl in [
             ("avatar",     "ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT ''"),
+            ("bio",        "ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''"),
+            ("status",     "ALTER TABLE users ADD COLUMN status TEXT DEFAULT ''"),
             ("is_owner",   "ALTER TABLE users ADD COLUMN is_owner INTEGER DEFAULT 0"),
             ("role_id",    "ALTER TABLE users ADD COLUMN role_id INTEGER"),
             ("created_at", "ALTER TABLE users ADD COLUMN created_at TIMESTAMP"),
+            ("last_seen",  "ALTER TABLE users ADD COLUMN last_seen TIMESTAMP"),
         ]:
             if name not in uc:
                 db.execute(ddl)
         db.execute("UPDATE users SET is_owner=1 WHERE id=(SELECT MIN(id) FROM users)")
+        db.execute("UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE last_seen IS NULL")
     if table_exists("pages") and "tags" not in cols("pages"):
         db.execute("ALTER TABLE pages ADD COLUMN tags TEXT DEFAULT ''")
     if table_exists("invites") and "role_id" not in cols("invites"):
@@ -162,6 +179,35 @@ def has_perm(perm: str) -> bool:
     return perm in current_perms()
 
 
+# ===== ОНЛАЙН-СТАТУС =====
+def is_online(last_seen_str):
+    if not last_seen_str:
+        return False
+    try:
+        # SQLite отдаёт 'YYYY-MM-DD HH:MM:SS' в UTC
+        last = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return False
+    return (datetime.utcnow() - last) < timedelta(seconds=ONLINE_TIMEOUT_SEC)
+
+def human_last_seen(last_seen_str):
+    if not last_seen_str:
+        return "неизвестно"
+    try:
+        last = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return "неизвестно"
+    delta = datetime.utcnow() - last
+    secs = int(delta.total_seconds())
+    if secs < ONLINE_TIMEOUT_SEC:
+        return "в сети"
+    if secs < 3600:
+        return f"был {secs // 60} мин назад"
+    if secs < 86400:
+        return f"был {secs // 3600} ч назад"
+    return f"был {secs // 86400} дн назад"
+
+
 # ===== ДЕКОРАТОРЫ =====
 def login_required(f):
     @wraps(f)
@@ -194,6 +240,19 @@ def perm_required(perm: str):
     return deco
 
 
+# ===== ОБНОВЛЕНИЕ last_seen ПРИ КАЖДОМ ЗАПРОСЕ =====
+@app.before_request
+def update_last_seen():
+    if "user" in session:
+        try:
+            db = get_db()
+            db.execute("UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE username=?",
+                       (session["user"],))
+            db.commit()
+        except Exception:
+            pass
+
+
 # ===== БАЗОВЫЙ ШАБЛОН =====
 BASE = """
 <!doctype html>
@@ -214,7 +273,7 @@ BASE = """
     --bg: #ffffff; --bg-soft: #f6f8fa; --bg-card: #ffffff;
     --border: #e5e7eb; --text: #1f2328; --text-muted: #656d76;
     --accent: #3b82f6; --accent-hover: #2563eb; --accent-soft: #eff6ff;
-    --danger: #dc2626;
+    --danger: #dc2626; --online: #22c55e;
     --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
     --radius: 10px;
   }
@@ -222,7 +281,7 @@ BASE = """
     --bg: #0d1117; --bg-soft: #161b22; --bg-card: #161b22;
     --border: #30363d; --text: #e6edf3; --text-muted: #8b949e;
     --accent: #58a6ff; --accent-hover: #79b8ff; --accent-soft: #1f2937;
-    --danger: #f85149;
+    --danger: #f85149; --online: #22c55e;
     --shadow: 0 1px 3px rgba(0,0,0,0.4);
   }
   * { box-sizing: border-box; }
@@ -325,6 +384,13 @@ BASE = """
     background: var(--border); display: inline-block; vertical-align: middle;
   }
   .avatar-lg { width: 56px; height: 56px; }
+  .avatar-wrap { position: relative; display: inline-block; }
+  .online-dot {
+    position: absolute; bottom: 0; right: 0;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--online); border: 2px solid var(--bg-card);
+  }
+  .online-dot.offline { background: #9ca3af; }
   .chat-box {
     background: var(--bg-soft); border: 1px solid var(--border);
     border-radius: var(--radius); height: 440px; overflow-y: auto;
@@ -355,20 +421,26 @@ BASE = """
     <nav>
       {% if session.user %}
         <a href="{{ url_for('chat') }}">💬 Чат</a>
+        <a href="{{ url_for('messages_inbox') }}">✉️ Личные
+          {% if unread_count %}<span class="tag" style="background:#ef4444;color:#fff;margin-left:.2rem">{{ unread_count }}</span>{% endif %}
+        </a>
         {% if 'create_page' in perms %}
           <a href="{{ url_for('new_page') }}">+ Статья</a>
         {% endif %}
         {% if is_owner or 'view_admin' in perms or 'manage_users' in perms or 'manage_roles' in perms %}
           <a href="{{ url_for('admin_users') }}" class="primary">👥 Админка</a>
         {% endif %}
-        <a href="{{ url_for('profile') }}" class="user-chip">
-          {% if me and me['avatar'] %}
-            <img class="avatar" src="{{ url_for('uploaded_file', filename=me['avatar']) }}">
-          {% else %}
-            <span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-size:.75rem;color:var(--text-muted)">
-              {{ session.user[0]|upper }}
-            </span>
-          {% endif %}
+        <a href="{{ url_for('user_profile', username=session.user) }}" class="user-chip">
+          <span class="avatar-wrap">
+            {% if me and me['avatar'] %}
+              <img class="avatar" src="{{ url_for('uploaded_file', filename=me['avatar']) }}">
+            {% else %}
+              <span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-size:.75rem;color:var(--text-muted)">
+                {{ session.user[0]|upper }}
+              </span>
+            {% endif %}
+            <span class="online-dot"></span>
+          </span>
           <span>{{ session.user }}{% if is_owner %} ★{% endif %}</span>
           {% if role %}
             <span class="tag" style="background:{{ role['color'] }}22;color:{{ role['color'] }};margin-left:.2rem">{{ role['name'] }}</span>
@@ -413,7 +485,7 @@ def tpl(body: str) -> str:
                         "{% block body %}" + body + "{% endblock %}")
 
 
-# ===== ШАБЛОНЫ СТРАНИЦ =====
+# ===== ШАБЛОНЫ =====
 INDEX_TPL = tpl("""
 <h1>Все статьи</h1>
 <form method="get" action="{{ url_for('index') }}">
@@ -437,7 +509,10 @@ INDEX_TPL = tpl("""
           <a href="{{ url_for('index', tag=t.strip()) }}" class="tag">{{ t.strip() }}</a>
         {% endfor %}
       </div>
-      <div class="muted">автор: {{ p['author'] }} · обновлено {{ p['updated_at'] }}</div>
+      <div class="muted">автор:
+        <a href="{{ url_for('user_profile', username=p['author']) }}">{{ p['author'] }}</a>
+        · обновлено {{ p['updated_at'] }}
+      </div>
     </div>
   {% endfor %}
 {% else %}
@@ -453,7 +528,8 @@ INDEX_TPL = tpl("""
 VIEW_TPL = tpl("""
 <h1>{{ page['title'] }}</h1>
 <div class="muted" style="margin-bottom:.6rem">
-  автор: {{ page['author'] }} · slug: <code>{{ page['slug'] }}</code> · обновлено {{ page['updated_at'] }}
+  автор: <a href="{{ url_for('user_profile', username=page['author']) }}">{{ page['author'] }}</a>
+  · slug: <code>{{ page['slug'] }}</code> · обновлено {{ page['updated_at'] }}
 </div>
 <p>
   {% for t in (page['tags'] or '').split(',') if t.strip() %}
@@ -552,15 +628,20 @@ CHAT_TPL = tpl("""
 <div class="chat-box" id="chat-box">
   {% for m in messages %}
     <div class="msg">
-      {% if m['avatar'] %}
-        <img class="avatar" src="{{ url_for('uploaded_file', filename=m['avatar']) }}">
-      {% else %}
-        <span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-size:.75rem;color:var(--text-muted)">
-          {{ m['author'][0]|upper }}
+      <a href="{{ url_for('user_profile', username=m['author']) }}">
+        <span class="avatar-wrap">
+          {% if m['avatar'] %}
+            <img class="avatar" src="{{ url_for('uploaded_file', filename=m['avatar']) }}">
+          {% else %}
+            <span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-size:.75rem;color:var(--text-muted)">
+              {{ m['author'][0]|upper }}
+            </span>
+          {% endif %}
+          <span class="online-dot {% if not m['online'] %}offline{% endif %}"></span>
         </span>
-      {% endif %}
+      </a>
       <div style="flex:1">
-        <span class="who">{{ m['author'] }}</span>
+        <a href="{{ url_for('user_profile', username=m['author']) }}" class="who">{{ m['author'] }}</a>
         <span class="when">{{ m['created_at'] }}</span>
         {% if 'chat_delete' in perms %}
           <form method="post" action="{{ url_for('chat_delete', mid=m['id']) }}"
@@ -592,25 +673,41 @@ CHAT_TPL = tpl("""
 """)
 
 PROFILE_TPL = tpl("""
-<h1>Профиль</h1>
-<div class="card">
-  <p style="display:flex;align-items:center;gap:1rem;margin:0 0 .5rem">
+<h1>Мой профиль</h1>
+<div class="card" style="display:flex;gap:1.5rem;align-items:flex-start">
+  <span class="avatar-wrap">
     {% if me and me['avatar'] %}
-      <img class="avatar avatar-lg" src="{{ url_for('uploaded_file', filename=me['avatar']) }}">
+      <img class="avatar avatar-lg" style="width:96px;height:96px" src="{{ url_for('uploaded_file', filename=me['avatar']) }}">
     {% else %}
-      <span class="avatar avatar-lg" style="display:inline-flex;align-items:center;justify-content:center;font-size:1.3rem;color:var(--text-muted)">
+      <span class="avatar avatar-lg" style="width:96px;height:96px;font-size:2.4rem;display:inline-flex;align-items:center;justify-content:center;color:var(--text-muted)">
         {{ me['username'][0]|upper }}
       </span>
     {% endif %}
-    <span>
-      <b style="font-size:1.15rem">{{ me['username'] }}</b>
+    <span class="online-dot"></span>
+  </span>
+  <div style="flex:1">
+    <h2 style="margin:0 0 .3rem">{{ me['username'] }}
       {% if is_owner %}<span class="tag">владелец ★</span>{% endif %}
-      {% if role %}
-        <span class="tag" style="background:{{ role['color'] }}22;color:{{ role['color'] }}">{{ role['name'] }}</span>
-      {% endif %}
-      <div class="muted">в системе с {{ me['created_at'] }}</div>
-    </span>
-  </p>
+      {% if role %}<span class="tag" style="background:{{ role['color'] }}22;color:{{ role['color'] }}">{{ role['name'] }}</span>{% endif %}
+    </h2>
+    <div class="muted">в системе с {{ me['created_at'] }}</div>
+    <a class="btn btn-ghost" style="margin-top:.6rem" href="{{ url_for('user_profile', username=me['username']) }}">
+      Открыть публичный профиль →
+    </a>
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">О себе</h2>
+  <form method="post" action="{{ url_for('update_profile') }}">
+    <label>Статус (короткая строка)</label>
+    <input name="status" maxlength="100" value="{{ me['status'] or '' }}"
+           placeholder="Например: Читаю вики">
+    <label>О себе (до 500 символов)</label>
+    <textarea name="bio" maxlength="500" style="min-height:120px"
+              placeholder="Пара слов о вас...">{{ me['bio'] or '' }}</textarea>
+    <button type="submit" style="margin-top:.6rem">Сохранить</button>
+  </form>
 </div>
 
 <div class="card">
@@ -637,6 +734,140 @@ PROFILE_TPL = tpl("""
     <button type="submit" style="margin-top:.6rem">Сменить пароль</button>
   </form>
 </div>
+""")
+
+USER_PROFILE_TPL = tpl("""
+<div class="card" style="display:flex;gap:1.5rem;align-items:flex-start">
+  <span class="avatar-wrap">
+    {% if user['avatar'] %}
+      <img class="avatar avatar-lg" style="width:96px;height:96px" src="{{ url_for('uploaded_file', filename=user['avatar']) }}">
+    {% else %}
+      <span class="avatar avatar-lg" style="width:96px;height:96px;font-size:2.4rem;display:inline-flex;align-items:center;justify-content:center;color:var(--text-muted)">
+        {{ user['username'][0]|upper }}
+      </span>
+    {% endif %}
+    <span class="online-dot {% if not online %}offline{% endif %}"></span>
+  </span>
+  <div style="flex:1">
+    <h1 style="margin:0 0 .3rem">{{ user['username'] }}
+      {% if user['is_owner'] %}<span class="tag">владелец ★</span>{% endif %}
+      {% if role %}<span class="tag" style="background:{{ role['color'] }}22;color:{{ role['color'] }}">{{ role['name'] }}</span>{% endif %}
+    </h1>
+    {% if user['status'] %}
+      <div class="muted" style="margin-bottom:.4rem">💬 {{ user['status'] }}</div>
+    {% endif %}
+    <div class="muted">
+      <span class="online-dot {% if not online %}offline{% endif %}"
+            style="position:static;display:inline-block;margin-right:.4rem;vertical-align:middle"></span>
+      {{ last_seen_text }}
+    </div>
+    <div class="muted" style="margin-top:.3rem">в системе с {{ user['created_at'] }}</div>
+    <div class="muted" style="margin-top:.3rem">
+      📝 статей: {{ pages_count }} · 💬 сообщений в чате: {{ chat_count }}
+    </div>
+    {% if session.user and session.user != user['username'] %}
+      <a class="btn" style="margin-top:.8rem"
+         href="{{ url_for('messages_with', username=user['username']) }}">
+        ✉️ Написать сообщение
+      </a>
+    {% endif %}
+    {% if session.user == user['username'] %}
+      <a class="btn btn-ghost" style="margin-top:.8rem" href="{{ url_for('profile') }}">
+        ✏️ Редактировать профиль
+      </a>
+    {% endif %}
+  </div>
+</div>
+
+{% if user['bio'] %}
+  <div class="card">
+    <h2 style="margin-top:0">О себе</h2>
+    <div style="white-space:pre-wrap">{{ user['bio'] }}</div>
+  </div>
+{% endif %}
+""")
+
+MESSAGES_TPL = tpl("""
+<h1>✉️ Личные сообщения</h1>
+{% if dialogs %}
+  {% for d in dialogs %}
+    <div class="card" style="display:flex;gap:1rem;align-items:center">
+      <a href="{{ url_for('user_profile', username=d['other']) }}">
+        <span class="avatar-wrap">
+          {% if d['avatar'] %}
+            <img class="avatar" style="width:44px;height:44px" src="{{ url_for('uploaded_file', filename=d['avatar']) }}">
+          {% else %}
+            <span class="avatar" style="width:44px;height:44px;font-size:1.2rem;display:inline-flex;align-items:center;justify-content:center;color:var(--text-muted)">
+              {{ d['other'][0]|upper }}
+            </span>
+          {% endif %}
+          <span class="online-dot {% if not d['online'] %}offline{% endif %}"></span>
+        </span>
+      </a>
+      <div style="flex:1">
+        <a href="{{ url_for('messages_with', username=d['other']) }}"><b>{{ d['other'] }}</b></a>
+        <span class="muted" style="font-size:.8rem;margin-left:.4rem">{{ d['last_seen_text'] }}</span>
+        <div class="muted">{{ d['last_body'][:80] }}{% if d['last_body']|length > 80 %}...{% endif %}</div>
+        <div class="muted" style="font-size:.8rem">{{ d['last_at'] }}</div>
+      </div>
+      {% if d['unread'] %}
+        <span class="tag" style="background:#ef4444;color:#fff">{{ d['unread'] }}</span>
+      {% endif %}
+    </div>
+  {% endfor %}
+{% else %}
+  <div class="card"><p class="muted">Пока нет диалогов. Откройте чей-нибудь профиль и напишите первым.</p></div>
+{% endif %}
+""")
+
+MESSAGES_WITH_TPL = tpl("""
+<h1 style="display:flex;align-items:center;gap:.6rem">
+  ✉️ Чат с
+  <a href="{{ url_for('user_profile', username=other['username']) }}"
+     style="display:inline-flex;align-items:center;gap:.5rem">
+    <span class="avatar-wrap">
+      {% if other['avatar'] %}
+        <img class="avatar" src="{{ url_for('uploaded_file', filename=other['avatar']) }}">
+      {% else %}
+        <span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-size:.75rem;color:var(--text-muted)">
+          {{ other['username'][0]|upper }}
+        </span>
+      {% endif %}
+      <span class="online-dot {% if not online %}offline{% endif %}"></span>
+    </span>
+    {{ other['username'] }}
+  </a>
+  <span class="muted" style="font-size:.9rem;font-weight:400">{{ last_seen_text }}</span>
+</h1>
+<div class="chat-box" id="chat-box" style="height:400px">
+  {% for m in messages %}
+    <div class="msg">
+      {% if m['sender'] == session.user %}
+        <div style="flex:1;text-align:right">
+          <span class="who">Вы</span>
+          <span class="when">{{ m['created_at'] }}</span>
+          <div class="body" style="display:inline-block;background:var(--accent-soft);padding:.4rem .7rem;border-radius:10px;margin-top:.2rem;text-align:left">{{ m['body'] }}</div>
+        </div>
+      {% else %}
+        <div style="flex:1">
+          <span class="who">{{ m['sender'] }}</span>
+          <span class="when">{{ m['created_at'] }}</span>
+          <div class="body" style="display:inline-block;background:var(--bg-soft);padding:.4rem .7rem;border-radius:10px;margin-top:.2rem">{{ m['body'] }}</div>
+        </div>
+      {% endif %}
+    </div>
+  {% else %}
+    <p class="muted">Начните диалог первым сообщением.</p>
+  {% endfor %}
+</div>
+<form method="post" action="{{ url_for('messages_with', username=other['username']) }}" style="margin-top:1rem">
+  <input name="body" placeholder="Ваше сообщение..." required autocomplete="off">
+  <button type="submit" style="margin-top:.4rem">Отправить</button>
+</form>
+<script>
+  const box = document.getElementById('chat-box');
+  if (box) box.scrollTop = box.scrollHeight;
+</script>
 """)
 
 ADMIN_TPL = tpl("""
@@ -731,15 +962,22 @@ ADMIN_TPL = tpl("""
 <div class="card">
   <h2 style="margin-top:0">Все пользователи ({{ users|length }})</h2>
   <table>
-    <tr><th></th><th>Логин</th><th>Роль</th><th>Создан</th><th></th></tr>
+    <tr><th></th><th>Логин</th><th>Онлайн</th><th>Роль</th><th>Создан</th><th></th></tr>
     {% for u in users %}
       <tr>
         <td style="width:40px">
-          {% if u['avatar'] %}
-            <img class="avatar" src="{{ url_for('uploaded_file', filename=u['avatar']) }}">
-          {% endif %}
+          <span class="avatar-wrap">
+            {% if u['avatar'] %}
+              <img class="avatar" src="{{ url_for('uploaded_file', filename=u['avatar']) }}">
+            {% endif %}
+            <span class="online-dot {% if not u['online'] %}offline{% endif %}"></span>
+          </span>
         </td>
-        <td><b>{{ u['username'] }}</b>{% if u['is_owner'] %} <span class="tag">владелец ★</span>{% endif %}</td>
+        <td>
+          <a href="{{ url_for('user_profile', username=u['username']) }}"><b>{{ u['username'] }}</b></a>
+          {% if u['is_owner'] %} <span class="tag">владелец ★</span>{% endif %}
+        </td>
+        <td class="muted" style="font-size:.85rem">{{ u['last_seen_text'] }}</td>
         <td>
           {% if not u['is_owner'] %}
             <form method="post" action="{{ url_for('admin_set_role', uid=u['id']) }}"
@@ -819,12 +1057,16 @@ INVITE_TPL = tpl("""
 def inject_user():
     me = None
     role = None
+    unread_count = 0
     if "user" in session:
         db = get_db()
         me = db.execute("SELECT * FROM users WHERE username=?",
                         (session["user"],)).fetchone()
         if me:
             role = get_role(db, me["role_id"])
+            unread_count = db.execute(
+                "SELECT COUNT(*) c FROM private_messages WHERE recipient=? AND is_read=0",
+                (session["user"],)).fetchone()["c"]
     return {
         "me": me,
         "role": role,
@@ -832,6 +1074,9 @@ def inject_user():
         "perms": current_perms(),
         "PERMS": PERMS,
         "max_mb": MAX_AVATAR_BYTES // (1024 * 1024),
+        "unread_count": unread_count,
+        "is_online": is_online,
+        "human_last_seen": human_last_seen,
     }
 
 
@@ -985,6 +1230,8 @@ def login():
         if user and verify_password(password, user["password"]):
             session["user"] = username
             session["is_owner"] = bool(user["is_owner"])
+            db.execute("UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE username=?", (username,))
+            db.commit()
             nxt = request.args.get("next") or url_for("index")
             return redirect(nxt)
         flash("Неверный логин или пароль")
@@ -1053,6 +1300,103 @@ def logout():
     return redirect(url_for("login"))
 
 
+# ===== ПУБЛИЧНЫЙ ПРОФИЛЬ =====
+@app.route("/user/<username>")
+@login_required
+def user_profile(username):
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not user:
+        abort(404)
+    role = get_role(db, user["role_id"])
+    pages_count = db.execute("SELECT COUNT(*) c FROM pages WHERE author=?", (username,)).fetchone()["c"]
+    chat_count = db.execute("SELECT COUNT(*) c FROM messages WHERE author=?", (username,)).fetchone()["c"]
+    online = is_online(user["last_seen"])
+    last_seen_text = human_last_seen(user["last_seen"])
+    return render_template_string(USER_PROFILE_TPL, user=user, role=role,
+                                  pages_count=pages_count, chat_count=chat_count,
+                                  online=online, last_seen_text=last_seen_text)
+
+
+@app.route("/profile/edit", methods=["POST"])
+@login_required
+def update_profile():
+    db = get_db()
+    status = request.form.get("status", "").strip()[:100]
+    bio = request.form.get("bio", "").strip()[:500]
+    db.execute("UPDATE users SET status=?, bio=? WHERE username=?",
+               (status, bio, session["user"]))
+    db.commit()
+    flash("Профиль обновлён")
+    return redirect(url_for("profile"))
+
+
+# ===== ЛИЧНЫЕ СООБЩЕНИЯ =====
+@app.route("/messages")
+@login_required
+def messages_inbox():
+    db = get_db()
+    me = session["user"]
+    rows = db.execute("""
+        SELECT * FROM private_messages
+        WHERE sender=? OR recipient=?
+        ORDER BY id DESC
+    """, (me, me)).fetchall()
+    dialogs = {}
+    for r in rows:
+        other = r["recipient"] if r["sender"] == me else r["sender"]
+        if other not in dialogs:
+            dialogs[other] = {
+                "other": other,
+                "last_body": r["body"],
+                "last_at": r["created_at"],
+                "unread": 0,
+            }
+        if r["recipient"] == me and not r["is_read"]:
+            dialogs[other]["unread"] += 1
+    dialog_list = []
+    for d in dialogs.values():
+        u = db.execute("SELECT avatar, last_seen FROM users WHERE username=?", (d["other"],)).fetchone()
+        d["avatar"] = u["avatar"] if u else ""
+        d["online"] = is_online(u["last_seen"]) if u else False
+        d["last_seen_text"] = human_last_seen(u["last_seen"]) if u else "неизвестно"
+        dialog_list.append(d)
+    return render_template_string(MESSAGES_TPL, dialogs=dialog_list)
+
+
+@app.route("/messages/<username>", methods=["GET", "POST"])
+@login_required
+def messages_with(username):
+    db = get_db()
+    if username == session["user"]:
+        return redirect(url_for("messages_inbox"))
+    other = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not other:
+        abort(404)
+
+    if request.method == "POST":
+        body = request.form.get("body", "").strip()
+        if body:
+            db.execute("INSERT INTO private_messages (sender, recipient, body) VALUES (?,?,?)",
+                       (session["user"], username, body[:2000]))
+            db.commit()
+        return redirect(url_for("messages_with", username=username))
+
+    db.execute("UPDATE private_messages SET is_read=1 WHERE recipient=? AND sender=?",
+               (session["user"], username))
+    db.commit()
+
+    messages = db.execute("""
+        SELECT * FROM private_messages
+        WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?)
+        ORDER BY id ASC LIMIT 500
+    """, (session["user"], username, username, session["user"])).fetchall()
+    online = is_online(other["last_seen"])
+    last_seen_text = human_last_seen(other["last_seen"])
+    return render_template_string(MESSAGES_WITH_TPL, other=other, messages=messages,
+                                  online=online, last_seen_text=last_seen_text)
+
+
 # ===== АДМИНКА =====
 @app.route("/admin/users")
 @login_required
@@ -1061,7 +1405,13 @@ def admin_users():
             has_perm("manage_users") or has_perm("manage_roles")):
         abort(403)
     db = get_db()
-    users = db.execute("SELECT * FROM users ORDER BY id").fetchall()
+    users_rows = db.execute("SELECT * FROM users ORDER BY id").fetchall()
+    users = []
+    for u in users_rows:
+        d = dict(u)
+        d["online"] = is_online(u["last_seen"])
+        d["last_seen_text"] = human_last_seen(u["last_seen"])
+        users.append(d)
     roles = db.execute("SELECT * FROM roles ORDER BY name").fetchall()
     invites = db.execute("""
         SELECT i.token, i.created_at, r.name AS role_name
@@ -1252,13 +1602,17 @@ def change_password():
 @login_required
 def chat():
     db = get_db()
-    msgs = db.execute("""
-        SELECT m.*, u.avatar AS avatar
+    rows = db.execute("""
+        SELECT m.*, u.avatar AS avatar, u.last_seen AS last_seen
         FROM messages m
         LEFT JOIN users u ON u.username = m.author
         ORDER BY m.id DESC LIMIT 200
     """).fetchall()
-    msgs = list(reversed(msgs))
+    msgs = []
+    for m in reversed(rows):
+        d = dict(m)
+        d["online"] = is_online(m["last_seen"])
+        msgs.append(d)
     return render_template_string(CHAT_TPL, messages=msgs)
 
 
@@ -1282,8 +1636,6 @@ def chat_delete(mid):
     db.commit()
     return redirect(url_for("chat"))
 
-
-import os
 
 if __name__ == "__main__":
     init_db()
