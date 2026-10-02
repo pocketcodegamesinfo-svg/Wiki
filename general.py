@@ -6,7 +6,8 @@ import hashlib
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import (Flask, request, session, redirect, url_for,
-                   render_template_string, g, abort, send_from_directory, flash)
+                   render_template_string, g, abort, send_from_directory,
+                   flash, jsonify)
 
 # ===== НАСТРОЙКИ =====
 SECRET_KEY = os.environ.get("SECRET_KEY") or "temp-key-for-local-dev"
@@ -184,7 +185,6 @@ def is_online(last_seen_str):
     if not last_seen_str:
         return False
     try:
-        # SQLite отдаёт 'YYYY-MM-DD HH:MM:SS' в UTC
         last = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
     except (ValueError, TypeError):
         return False
@@ -240,7 +240,7 @@ def perm_required(perm: str):
     return deco
 
 
-# ===== ОБНОВЛЕНИЕ last_seen ПРИ КАЖДОМ ЗАПРОСЕ =====
+# ===== ОБНОВЛЕНИЕ last_seen =====
 @app.before_request
 def update_last_seen():
     if "user" in session:
@@ -625,9 +625,9 @@ REGISTER_INFO_TPL = tpl("""
 
 CHAT_TPL = tpl("""
 <h1>💬 Общий чат</h1>
-<div class="chat-box" id="chat-box">
+<div class="chat-box" id="chat-box" data-last-id="{{ last_id }}">
   {% for m in messages %}
-    <div class="msg">
+    <div class="msg" data-id="{{ m['id'] }}">
       <a href="{{ url_for('user_profile', username=m['author']) }}">
         <span class="avatar-wrap">
           {% if m['avatar'] %}
@@ -644,31 +644,100 @@ CHAT_TPL = tpl("""
         <a href="{{ url_for('user_profile', username=m['author']) }}" class="who">{{ m['author'] }}</a>
         <span class="when">{{ m['created_at'] }}</span>
         {% if 'chat_delete' in perms %}
-          <form method="post" action="{{ url_for('chat_delete', mid=m['id']) }}"
-                style="display:inline;float:right"
-                onsubmit="return confirm('Удалить сообщение?')">
-            <button class="btn btn-danger" type="submit"
-                    style="padding:.1rem .5rem;font-size:.75rem">×</button>
-          </form>
+          <button class="btn btn-danger" style="padding:.1rem .5rem;font-size:.75rem;float:right"
+                  onclick="deleteMessage({{ m['id'] }})">×</button>
         {% endif %}
         <div class="body">{{ m['body'] }}</div>
       </div>
     </div>
-  {% else %}
-    <p class="muted">Сообщений пока нет. Напишите первым!</p>
   {% endfor %}
 </div>
 {% if 'chat_write' in perms %}
-<form method="post" action="{{ url_for('chat_send') }}" style="margin-top:1rem">
-  <input name="body" placeholder="Ваше сообщение..." required autocomplete="off">
+<form id="chat-form" style="margin-top:1rem" onsubmit="return sendMessage(event)">
+  <input name="body" id="chat-input" placeholder="Ваше сообщение..." required autocomplete="off">
   <button type="submit" style="margin-top:.4rem">Отправить</button>
 </form>
 {% else %}
 <p class="muted">У вас нет права писать в чат.</p>
 {% endif %}
+
 <script>
-  const box = document.getElementById('chat-box');
-  if (box) box.scrollTop = box.scrollHeight;
+const box = document.getElementById('chat-box');
+const canDelete = {{ ('chat_delete' in perms)|tojson }};
+
+function scrollDown() { if (box) box.scrollTop = box.scrollHeight; }
+scrollDown();
+
+function renderMsg(m) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg';
+  wrap.dataset.id = m.id;
+  const avatarHtml = m.avatar
+    ? `<img class="avatar" src="/uploads/${m.avatar}">`
+    : `<span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-size:.75rem;color:var(--text-muted)">${m.author[0].toUpperCase()}</span>`;
+  const delBtn = canDelete
+    ? `<button class="btn btn-danger" style="padding:.1rem .5rem;font-size:.75rem;float:right" onclick="deleteMessage(${m.id})">×</button>`
+    : '';
+  wrap.innerHTML = `
+    <a href="/user/${encodeURIComponent(m.author)}">
+      <span class="avatar-wrap">
+        ${avatarHtml}
+        <span class="online-dot ${m.online ? '' : 'offline'}"></span>
+      </span>
+    </a>
+    <div style="flex:1">
+      <a href="/user/${encodeURIComponent(m.author)}" class="who">${m.author}</a>
+      <span class="when">${m.created_at}</span>
+      ${delBtn}
+      <div class="body">${m.body}</div>
+    </div>`;
+  return wrap;
+}
+
+async function pollMessages() {
+  if (!box) return;
+  try {
+    const lastId = box.dataset.lastId || '0';
+    const r = await fetch(`/chat/messages?after=${lastId}`);
+    if (!r.ok) return;
+    const arr = await r.json();
+    let added = 0;
+    for (const m of arr) {
+      if (box.querySelector(`[data-id="${m.id}"]`)) continue;
+      box.appendChild(renderMsg(m));
+      box.dataset.lastId = m.id;
+      added++;
+    }
+    if (added) scrollDown();
+  } catch (e) {}
+}
+setInterval(pollMessages, 2000);
+
+async function sendMessage(ev) {
+  ev.preventDefault();
+  const input = document.getElementById('chat-input');
+  const body = input.value.trim();
+  if (!body) return false;
+  input.value = '';
+  try {
+    await fetch('/chat/send_ajax', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({body})
+    });
+    pollMessages();
+  } catch (e) {}
+  return false;
+}
+
+function deleteMessage(id) {
+  if (!confirm('Удалить сообщение?')) return;
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = `/chat/delete/${id}`;
+  document.body.appendChild(form);
+  form.submit();
+}
 </script>
 """)
 
@@ -839,9 +908,9 @@ MESSAGES_WITH_TPL = tpl("""
   </a>
   <span class="muted" style="font-size:.9rem;font-weight:400">{{ last_seen_text }}</span>
 </h1>
-<div class="chat-box" id="chat-box" style="height:400px">
+<div class="chat-box" id="chat-box" data-last-id="{{ last_id }}" data-other="{{ other['username'] }}" style="height:400px">
   {% for m in messages %}
-    <div class="msg">
+    <div class="msg" data-id="{{ m['id'] }}">
       {% if m['sender'] == session.user %}
         <div style="flex:1;text-align:right">
           <span class="who">Вы</span>
@@ -856,17 +925,73 @@ MESSAGES_WITH_TPL = tpl("""
         </div>
       {% endif %}
     </div>
-  {% else %}
-    <p class="muted">Начните диалог первым сообщением.</p>
   {% endfor %}
 </div>
-<form method="post" action="{{ url_for('messages_with', username=other['username']) }}" style="margin-top:1rem">
-  <input name="body" placeholder="Ваше сообщение..." required autocomplete="off">
+<form id="pm-form" style="margin-top:1rem" onsubmit="return sendPM(event)">
+  <input name="body" id="pm-input" placeholder="Ваше сообщение..." required autocomplete="off">
   <button type="submit" style="margin-top:.4rem">Отправить</button>
 </form>
 <script>
-  const box = document.getElementById('chat-box');
-  if (box) box.scrollTop = box.scrollHeight;
+const box = document.getElementById('chat-box');
+const other = box.dataset.other;
+
+function scrollDown() { box.scrollTop = box.scrollHeight; }
+scrollDown();
+
+function renderPM(m) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg';
+  wrap.dataset.id = m.id;
+  if (m.is_me) {
+    wrap.innerHTML = `<div style="flex:1;text-align:right">
+      <span class="who">Вы</span>
+      <span class="when">${m.created_at}</span>
+      <div class="body" style="display:inline-block;background:var(--accent-soft);padding:.4rem .7rem;border-radius:10px;margin-top:.2rem;text-align:left">${m.body}</div>
+    </div>`;
+  } else {
+    wrap.innerHTML = `<div style="flex:1">
+      <span class="who">${m.sender}</span>
+      <span class="when">${m.created_at}</span>
+      <div class="body" style="display:inline-block;background:var(--bg-soft);padding:.4rem .7rem;border-radius:10px;margin-top:.2rem">${m.body}</div>
+    </div>`;
+  }
+  return wrap;
+}
+
+async function pollPM() {
+  try {
+    const lastId = box.dataset.lastId || '0';
+    const r = await fetch(`/messages/${encodeURIComponent(other)}/api?after=${lastId}`);
+    if (!r.ok) return;
+    const arr = await r.json();
+    let added = 0;
+    for (const m of arr) {
+      if (box.querySelector(`[data-id="${m.id}"]`)) continue;
+      box.appendChild(renderPM(m));
+      box.dataset.lastId = m.id;
+      added++;
+    }
+    if (added) scrollDown();
+  } catch (e) {}
+}
+setInterval(pollPM, 2000);
+
+async function sendPM(ev) {
+  ev.preventDefault();
+  const input = document.getElementById('pm-input');
+  const body = input.value.trim();
+  if (!body) return false;
+  input.value = '';
+  try {
+    await fetch(`/messages/${encodeURIComponent(other)}/send_ajax`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({body})
+    });
+    pollPM();
+  } catch (e) {}
+  return false;
+}
 </script>
 """)
 
@@ -1003,6 +1128,8 @@ ADMIN_TPL = tpl("""
               <button class="btn btn-danger" type="submit"
                       style="padding:.3rem .7rem;font-size:.85rem">Удалить</button>
             </form>
+          {% else %}
+            <span class="muted" title="Владельца удалить нельзя">🔒</span>
           {% endif %}
         </td>
       </tr>
@@ -1064,9 +1191,12 @@ def inject_user():
                         (session["user"],)).fetchone()
         if me:
             role = get_role(db, me["role_id"])
-            unread_count = db.execute(
-                "SELECT COUNT(*) c FROM private_messages WHERE recipient=? AND is_read=0",
-                (session["user"],)).fetchone()["c"]
+            try:
+                unread_count = db.execute(
+                    "SELECT COUNT(*) c FROM private_messages WHERE recipient=? AND is_read=0",
+                    (session["user"],)).fetchone()["c"]
+            except sqlite3.OperationalError:
+                unread_count = 0
     return {
         "me": me,
         "role": role,
@@ -1075,8 +1205,6 @@ def inject_user():
         "PERMS": PERMS,
         "max_mb": MAX_AVATAR_BYTES // (1024 * 1024),
         "unread_count": unread_count,
-        "is_online": is_online,
-        "human_last_seen": human_last_seen,
     }
 
 
@@ -1393,8 +1521,102 @@ def messages_with(username):
     """, (session["user"], username, username, session["user"])).fetchall()
     online = is_online(other["last_seen"])
     last_seen_text = human_last_seen(other["last_seen"])
+    last_id = messages[-1]["id"] if messages else 0
     return render_template_string(MESSAGES_WITH_TPL, other=other, messages=messages,
-                                  online=online, last_seen_text=last_seen_text)
+                                  online=online, last_seen_text=last_seen_text,
+                                  last_id=last_id)
+
+
+# ===== API: общий чат =====
+@app.route("/chat/messages")
+@login_required
+def chat_messages_api():
+    try:
+        after = int(request.args.get("after", 0))
+    except ValueError:
+        after = 0
+    db = get_db()
+    rows = db.execute("""
+        SELECT m.id, m.author, m.body, m.created_at, u.avatar, u.last_seen
+        FROM messages m
+        LEFT JOIN users u ON u.username = m.author
+        WHERE m.id > ?
+        ORDER BY m.id ASC
+        LIMIT 200
+    """, (after,)).fetchall()
+    out = []
+    for m in rows:
+        out.append({
+            "id": m["id"],
+            "author": m["author"],
+            "body": m["body"],
+            "created_at": m["created_at"],
+            "avatar": m["avatar"] or "",
+            "online": is_online(m["last_seen"]),
+            "is_me": m["author"] == session["user"],
+        })
+    return jsonify(out)
+
+
+@app.route("/chat/send_ajax", methods=["POST"])
+@perm_required("chat_write")
+def chat_send_ajax():
+    data = request.get_json(silent=True) or {}
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify({"ok": False, "error": "Пустое сообщение"}), 400
+    db = get_db()
+    cur = db.execute("INSERT INTO messages (author, body) VALUES (?, ?)",
+                     (session["user"], body[:2000]))
+    db.commit()
+    return jsonify({"ok": True, "id": cur.lastrowid})
+
+
+# ===== API: личные сообщения =====
+@app.route("/messages/<username>/api")
+@login_required
+def pm_messages_api(username):
+    try:
+        after = int(request.args.get("after", 0))
+    except ValueError:
+        after = 0
+    db = get_db()
+    rows = db.execute("""
+        SELECT * FROM private_messages
+        WHERE ((sender=? AND recipient=?) OR (sender=? AND recipient=?))
+          AND id > ?
+        ORDER BY id ASC LIMIT 500
+    """, (session["user"], username, username, session["user"], after)).fetchall()
+    db.execute("UPDATE private_messages SET is_read=1 WHERE recipient=? AND sender=?",
+               (session["user"], username))
+    db.commit()
+    out = []
+    for m in rows:
+        out.append({
+            "id": m["id"],
+            "sender": m["sender"],
+            "body": m["body"],
+            "created_at": m["created_at"],
+            "is_me": m["sender"] == session["user"],
+        })
+    return jsonify(out)
+
+
+@app.route("/messages/<username>/send_ajax", methods=["POST"])
+@login_required
+def pm_send_ajax(username):
+    data = request.get_json(silent=True) or {}
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify({"ok": False, "error": "Пустое сообщение"}), 400
+    db = get_db()
+    other = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+    if not other:
+        return jsonify({"ok": False, "error": "Пользователь не найден"}), 404
+    cur = db.execute("INSERT INTO private_messages (sender, recipient, body) VALUES (?,?,?)",
+                     (session["user"], username, body[:2000]))
+    db.commit()
+    return jsonify({"ok": True, "id": cur.lastrowid})
 
 
 # ===== АДМИНКА =====
@@ -1473,7 +1695,7 @@ def admin_edit_role(rid):
 @perm_required("manage_roles")
 def admin_delete_role(rid):
     db = get_db()
-    db.execute("UPDATE users SET role_id=NULL WHERE role_id=?", (rid,))
+    db.execute("UPDATE users SET role_id=NULL WHERE role_id=? AND is_owner=0", (rid,))
     db.execute("DELETE FROM roles WHERE id=?", (rid,))
     db.commit()
     flash("Роль удалена")
@@ -1485,9 +1707,20 @@ def admin_delete_role(rid):
 def admin_set_role(uid):
     rid = request.form.get("role_id") or None
     db = get_db()
-    db.execute("UPDATE users SET role_id=? WHERE id=? AND is_owner=0", (rid, uid))
+    u = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        abort(404)
+    if u["is_owner"]:
+        flash("Нельзя менять роль владельца")
+        return redirect(url_for("admin_users"))
+    if rid:
+        r = db.execute("SELECT id FROM roles WHERE id=?", (rid,)).fetchone()
+        if not r:
+            flash("Роль не найдена")
+            return redirect(url_for("admin_users"))
+    db.execute("UPDATE users SET role_id=? WHERE id=?", (rid, uid))
     db.commit()
-    flash("Роль обновлена")
+    flash(f"Роль пользователя «{u['username']}» обновлена")
     return redirect(url_for("admin_users"))
 
 
@@ -1516,10 +1749,14 @@ def admin_create_user():
 def admin_delete_user(uid):
     db = get_db()
     u = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    if u and not u["is_owner"]:
-        db.execute("DELETE FROM users WHERE id=?", (uid,))
-        db.commit()
-        flash(f"Пользователь «{u['username']}» удалён")
+    if not u:
+        abort(404)
+    if u["is_owner"]:
+        flash("Нельзя удалить владельца")
+        return redirect(url_for("admin_users"))
+    db.execute("DELETE FROM users WHERE id=?", (uid,))
+    db.commit()
+    flash(f"Пользователь «{u['username']}» удалён")
     return redirect(url_for("admin_users"))
 
 
@@ -1613,19 +1850,8 @@ def chat():
         d = dict(m)
         d["online"] = is_online(m["last_seen"])
         msgs.append(d)
-    return render_template_string(CHAT_TPL, messages=msgs)
-
-
-@app.route("/chat/send", methods=["POST"])
-@perm_required("chat_write")
-def chat_send():
-    body = request.form.get("body", "").strip()
-    if body:
-        db = get_db()
-        db.execute("INSERT INTO messages (author, body) VALUES (?, ?)",
-                   (session["user"], body[:2000]))
-        db.commit()
-    return redirect(url_for("chat"))
+    last_id = msgs[-1]["id"] if msgs else 0
+    return render_template_string(CHAT_TPL, messages=msgs, last_id=last_id)
 
 
 @app.route("/chat/delete/<int:mid>", methods=["POST"])
@@ -1637,7 +1863,7 @@ def chat_delete(mid):
     return redirect(url_for("chat"))
 
 
-# Инициализация БД при импорте модуля — работает и под Gunicorn
+# ===== ИНИЦИАЛИЗАЦИЯ =====
 init_db()
 migrate_db()
 
