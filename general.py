@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import re
 import html
 import secrets
 import hashlib
@@ -11,16 +12,18 @@ from flask import (Flask, request, session, redirect, url_for,
 
 # ===== НАСТРОЙКИ =====
 SECRET_KEY = os.environ.get("SECRET_KEY") or "temp-key-for-local-dev"
-DB_PATH = "wiki.db"
-UPLOAD_DIR = "uploads"
+DB_PATH = os.environ.get("DB_PATH", "wiki.db")
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploads")
 ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
-MAX_AVATAR_BYTES = 2 * 1024 * 1024
-ONLINE_TIMEOUT_SEC = 300  # 5 минут — считаем «онлайн»
+MAX_AVATAR_BYTES = 2 * 1024 * 1024       # 2 МБ для аватаров
+MAX_IMG_BYTES = 5 * 1024 * 1024          # 5 МБ для картинок в статьях
+ONLINE_TIMEOUT_SEC = 300                  # 5 минут
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 МБ на запрос
 
 
 # ===== ПРАВА =====
@@ -407,6 +410,7 @@ BASE = """
   table { width: 100%; border-collapse: collapse; }
   th, td { padding: .6rem .5rem; text-align: left; border-bottom: 1px solid var(--border); }
   th { color: var(--text-muted); font-size: .85rem; font-weight: 600; }
+  .article-body img { max-width: 100%; border-radius: 8px; margin: .6rem 0; display: block; }
   @media (max-width: 600px) {
     header .container { gap: .5rem; }
     nav { font-size: .85rem; }
@@ -537,7 +541,7 @@ VIEW_TPL = tpl("""
   {% endfor %}
 </p>
 <hr>
-<div>{{ content_html|safe }}</div>
+<div class="article-body">{{ content_html|safe }}</div>
 <hr>
 {% if 'edit_any' in perms or ('edit_own' in perms and page['author'] == session.user) %}
   <a class="btn" href="{{ url_for('edit_page', slug=page['slug']) }}">✏️ Редактировать</a>
@@ -560,13 +564,82 @@ EDIT_TPL = tpl("""
          pattern="[a-z0-9\\-]+" title="латиница, цифры и дефис">
   <label>Теги (через запятую)</label>
   <input name="tags" value="{{ page['tags'] if page else '' }}">
-  <label>Содержимое (можно использовать # ## ### для заголовков)</label>
-  <textarea name="content" required>{{ page['content'] if page else '' }}</textarea>
+
+  <label>Содержимое
+    <span class="muted" style="font-weight:400">
+      (поддерживаются # ## ### для заголовков и ![alt](/uploads/...jpg) для картинок)
+    </span>
+  </label>
+
+  <div style="margin:.4rem 0;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap">
+    <input type="file" id="img-file" accept="image/*" style="display:none">
+    <button type="button" class="btn btn-ghost" onclick="document.getElementById('img-file').click()">
+      📷 Вставить картинку
+    </button>
+    <span class="muted" style="font-size:.85rem">или Ctrl+V из буфера</span>
+    <span id="img-status" class="muted" style="margin-left:.4rem"></span>
+  </div>
+
+  <textarea name="content" id="content-area" required>{{ page['content'] if page else '' }}</textarea>
+
   <div style="margin-top:1rem">
     <button type="submit">💾 Сохранить</button>
     <a class="btn btn-ghost" href="{{ url_for('index') }}">Отмена</a>
   </div>
 </form>
+
+<script>
+const imgInput = document.getElementById('img-file');
+const statusEl = document.getElementById('img-status');
+const area = document.getElementById('content-area');
+
+function insertAtCursor(text) {
+  const start = area.selectionStart;
+  const end = area.selectionEnd;
+  const before = area.value.slice(0, start);
+  const after = area.value.slice(end);
+  area.value = before + text + after;
+  area.selectionStart = area.selectionEnd = start + text.length;
+  area.focus();
+}
+
+async function uploadImage(file, label) {
+  statusEl.textContent = 'Загрузка...';
+  const fd = new FormData();
+  fd.append('image', file);
+  try {
+    const r = await fetch('/upload_image', { method: 'POST', body: fd });
+    const data = await r.json();
+    if (!data.ok) {
+      statusEl.textContent = '❌ ' + (data.error || 'Ошибка');
+      return;
+    }
+    insertAtCursor(`![${label}](${data.url})`);
+    statusEl.textContent = '✅ Вставлено';
+    setTimeout(() => statusEl.textContent = '', 2000);
+  } catch (e) {
+    statusEl.textContent = '❌ Сеть';
+  }
+}
+
+imgInput.addEventListener('change', () => {
+  const file = imgInput.files[0];
+  if (file) uploadImage(file, file.name);
+  imgInput.value = '';
+});
+
+area.addEventListener('paste', (e) => {
+  const items = (e.clipboardData && e.clipboardData.items) || [];
+  for (const it of items) {
+    if (it.type && it.type.startsWith('image/')) {
+      e.preventDefault();
+      const file = it.getAsFile();
+      if (file) uploadImage(file, 'screenshot');
+      return;
+    }
+  }
+});
+</script>
 """)
 
 LOGIN_TPL = tpl("""
@@ -668,13 +741,17 @@ const canDelete = {{ ('chat_delete' in perms)|tojson }};
 function scrollDown() { if (box) box.scrollTop = box.scrollHeight; }
 scrollDown();
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 function renderMsg(m) {
   const wrap = document.createElement('div');
   wrap.className = 'msg';
   wrap.dataset.id = m.id;
   const avatarHtml = m.avatar
-    ? `<img class="avatar" src="/uploads/${m.avatar}">`
-    : `<span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-size:.75rem;color:var(--text-muted)">${m.author[0].toUpperCase()}</span>`;
+    ? `<img class="avatar" src="/uploads/${encodeURIComponent(m.avatar)}">`
+    : `<span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-size:.75rem;color:var(--text-muted)">${escapeHtml(m.author[0].toUpperCase())}</span>`;
   const delBtn = canDelete
     ? `<button class="btn btn-danger" style="padding:.1rem .5rem;font-size:.75rem;float:right" onclick="deleteMessage(${m.id})">×</button>`
     : '';
@@ -686,10 +763,10 @@ function renderMsg(m) {
       </span>
     </a>
     <div style="flex:1">
-      <a href="/user/${encodeURIComponent(m.author)}" class="who">${m.author}</a>
-      <span class="when">${m.created_at}</span>
+      <a href="/user/${encodeURIComponent(m.author)}" class="who">${escapeHtml(m.author)}</a>
+      <span class="when">${escapeHtml(m.created_at)}</span>
       ${delBtn}
-      <div class="body">${m.body}</div>
+      <div class="body">${escapeHtml(m.body)}</div>
     </div>`;
   return wrap;
 }
@@ -938,6 +1015,10 @@ const other = box.dataset.other;
 function scrollDown() { box.scrollTop = box.scrollHeight; }
 scrollDown();
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 function renderPM(m) {
   const wrap = document.createElement('div');
   wrap.className = 'msg';
@@ -945,14 +1026,14 @@ function renderPM(m) {
   if (m.is_me) {
     wrap.innerHTML = `<div style="flex:1;text-align:right">
       <span class="who">Вы</span>
-      <span class="when">${m.created_at}</span>
-      <div class="body" style="display:inline-block;background:var(--accent-soft);padding:.4rem .7rem;border-radius:10px;margin-top:.2rem;text-align:left">${m.body}</div>
+      <span class="when">${escapeHtml(m.created_at)}</span>
+      <div class="body" style="display:inline-block;background:var(--accent-soft);padding:.4rem .7rem;border-radius:10px;margin-top:.2rem;text-align:left">${escapeHtml(m.body)}</div>
     </div>`;
   } else {
     wrap.innerHTML = `<div style="flex:1">
-      <span class="who">${m.sender}</span>
-      <span class="when">${m.created_at}</span>
-      <div class="body" style="display:inline-block;background:var(--bg-soft);padding:.4rem .7rem;border-radius:10px;margin-top:.2rem">${m.body}</div>
+      <span class="who">${escapeHtml(m.sender)}</span>
+      <span class="when">${escapeHtml(m.created_at)}</span>
+      <div class="body" style="display:inline-block;background:var(--bg-soft);padding:.4rem .7rem;border-radius:10px;margin-top:.2rem">${escapeHtml(m.body)}</div>
     </div>`;
   }
   return wrap;
@@ -1209,23 +1290,36 @@ def inject_user():
 
 
 # ===== РЕНДЕР CONTENT =====
+IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+
 def render_content(text: str) -> str:
     out = []
     for line in text.split("\n"):
         if line.startswith("### "):
             out.append(f"<h3>{html.escape(line[4:])}</h3>")
-        elif line.startswith("## "):
+            continue
+        if line.startswith("## "):
             out.append(f"<h2>{html.escape(line[3:])}</h2>")
-        elif line.startswith("# "):
+            continue
+        if line.startswith("# "):
             out.append(f"<h1>{html.escape(line[2:])}</h1>")
-        elif line.strip() == "":
+            continue
+        if line.strip() == "":
             out.append("<br>")
-        else:
-            out.append(f"<p>{html.escape(line)}</p>")
+            continue
+
+        safe = html.escape(line)
+        def repl(m):
+            alt, url = m.group(1), m.group(2)
+            if not (url.startswith("/uploads/") or url.startswith("http://") or url.startswith("https://")):
+                return m.group(0)
+            return f'<img src="{url}" alt="{alt}" style="max-width:100%;border-radius:8px;margin:.6rem 0">'
+        safe = IMG_RE.sub(repl, safe)
+        out.append(f"<p>{safe}</p>")
     return "\n".join(out)
 
 
-# ===== АВАТАРЫ =====
+# ===== АВАТАРЫ И КАРТИНКИ =====
 @app.route("/uploads/<filename>")
 def uploaded_file(filename):
     if "/" in filename or "\\" in filename or filename.startswith("."):
@@ -1242,6 +1336,20 @@ def save_avatar(file_storage, username: str):
     if len(data) > MAX_AVATAR_BYTES:
         return None
     name = f"{username}_{secrets.token_hex(6)}.{ext}"
+    with open(os.path.join(UPLOAD_DIR, name), "wb") as f:
+        f.write(data)
+    return name
+
+def save_article_image(file_storage):
+    if not file_storage or not file_storage.filename:
+        return None
+    ext = file_storage.filename.rsplit(".", 1)[-1].lower()
+    if ext not in ALLOWED_EXT:
+        return None
+    data = file_storage.read()
+    if len(data) > MAX_IMG_BYTES:
+        return None
+    name = f"img_{secrets.token_hex(8)}.{ext}"
     with open(os.path.join(UPLOAD_DIR, name), "wb") as f:
         f.write(data)
     return name
@@ -1341,6 +1449,18 @@ def delete_page(slug):
     db.execute("DELETE FROM pages WHERE slug=?", (slug,))
     db.commit()
     return redirect(url_for("index"))
+
+
+@app.route("/upload_image", methods=["POST"])
+@login_required
+def upload_image():
+    if not (has_perm("create_page") or has_perm("edit_any") or has_perm("edit_own")):
+        abort(403)
+    f = request.files.get("image")
+    name = save_article_image(f)
+    if not name:
+        return jsonify({"ok": False, "error": "Формат не поддерживается или файл > 5 МБ"}), 400
+    return jsonify({"ok": True, "url": f"/uploads/{name}", "name": name})
 
 
 # ===== АУТЕНТИФИКАЦИЯ =====
@@ -1527,7 +1647,7 @@ def messages_with(username):
                                   last_id=last_id)
 
 
-# ===== API: общий чат =====
+# ===== API: ОБЩИЙ ЧАТ =====
 @app.route("/chat/messages")
 @login_required
 def chat_messages_api():
@@ -1553,7 +1673,6 @@ def chat_messages_api():
             "created_at": m["created_at"],
             "avatar": m["avatar"] or "",
             "online": is_online(m["last_seen"]),
-            "is_me": m["author"] == session["user"],
         })
     return jsonify(out)
 
@@ -1572,7 +1691,7 @@ def chat_send_ajax():
     return jsonify({"ok": True, "id": cur.lastrowid})
 
 
-# ===== API: личные сообщения =====
+# ===== API: ЛИЧНЫЕ =====
 @app.route("/messages/<username>/api")
 @login_required
 def pm_messages_api(username):
