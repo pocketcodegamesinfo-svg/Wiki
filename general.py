@@ -8,7 +8,7 @@ from flask import (Flask, request, session, redirect, url_for,
                    render_template_string, g, abort, send_from_directory, flash)
 
 # ===== НАСТРОЙКИ =====
-SECRET_KEY = "замени-на-свой-секретный-ключ"
+SECRET_KEY = os.environ.get("SECRET_KEY") or "temp-key-for-local-dev"
 DB_PATH = "wiki.db"
 UPLOAD_DIR = "uploads"
 ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
