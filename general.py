@@ -20,6 +20,9 @@ MAX_AVATAR_BYTES = 2 * 1024 * 1024
 MAX_IMG_BYTES = 5 * 1024 * 1024
 ONLINE_TIMEOUT_SEC = 300
 
+# Режим техобслуживания: True — все кроме владельца увидят заглушку
+TESTING = os.environ.get("TESTING", "false").lower() in ("1", "true", "yes", "on")
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
@@ -46,7 +49,6 @@ def _clean_dsn(url: str) -> str:
     """Убираем параметры, которые ломают подключение к внутренней БД RelaxDev."""
     if not url:
         return url
-    # убираем sslmode=require и channel_binding, добавляем sslmode=disable
     url = re.sub(r"[?&]sslmode=[^&]*", "", url)
     url = re.sub(r"[?&]channel_binding=[^&]*", "", url)
     sep = "&" if "?" in url else "?"
@@ -75,9 +77,7 @@ def close_db(exc):
 
 
 def q(sql, params=None, fetch=None):
-    """Универсальный хелпер для запросов.
-    fetch: None (просто выполнить), 'one', 'all'.
-    """
+    """Хелпер: fetch=None (выполнить), 'one' (одна строка), 'all' (все)."""
     db = get_db()
     cur = db.cursor()
     cur.execute(sql, params or ())
@@ -196,7 +196,10 @@ def current_perms():
         return set(PERMS.keys())
     if "user" not in session:
         return set()
-    u = q("SELECT role_id FROM users WHERE username=%s", (session["user"],), fetch="one")
+    try:
+        u = q("SELECT role_id FROM users WHERE username=%s", (session["user"],), fetch="one")
+    except Exception:
+        return set()
     if not u:
         return set()
     return role_perms(get_role(None, u["role_id"]))
@@ -270,7 +273,7 @@ def perm_required(perm: str):
     return deco
 
 
-# ===== ОБНОВЛЕНИЕ last_seen =====
+# ===== BEFORE_REQUEST: last_seen + техработы =====
 @app.before_request
 def update_last_seen():
     if "user" in session:
@@ -279,7 +282,26 @@ def update_last_seen():
               (session["user"],))
             commit()
         except Exception:
-            get_db().rollback()
+            try: get_db().rollback()
+            except Exception: pass
+
+
+@app.before_request
+def maintenance_mode():
+    """Если TESTING=True — все, кроме владельца, видят заглушку."""
+    if not TESTING:
+        return None
+
+    # какие пути разрешены всем
+    allowed = ("/login", "/logout", "/uploads/", "/static/")
+    if any(request.path.startswith(p) for p in allowed):
+        return None
+
+    # владелец проходит всегда
+    if session.get("is_owner"):
+        return None
+
+    return render_template_string(MAINTENANCE_TPL), 503
 
 
 # ===== БАЗОВЫЙ ШАБЛОН =====
@@ -515,7 +537,38 @@ def tpl(body: str) -> str:
                         "{% block body %}" + body + "{% endblock %}")
 
 
-# ===== ШАБЛОНЫ =====
+# ===== ЗАГЛУШКА ТЕХРАБОТ =====
+MAINTENANCE_TPL = tpl("""
+<div style="text-align:center;padding:3rem 1rem;max-width:560px;margin:0 auto">
+  <div style="font-size:5rem;line-height:1;margin-bottom:1rem">🤖💤</div>
+  <h1 style="font-size:1.8rem;margin-bottom:.6rem">Робот сломался 😢</h1>
+  <p style="font-size:1.1rem;color:var(--text-muted);margin-bottom:1.5rem">
+    Приносим извинения — сайт временно отключён на техническое обслуживание.
+    Мы уже чиним робота и скоро вернёмся.
+  </p>
+
+  <pre style="display:inline-block;text-align:left;background:var(--bg-soft);
+              border:1px solid var(--border);border-radius:10px;padding:1rem 1.4rem;
+              font-family:ui-monospace,SFMono-Regular,monospace;font-size:.85rem;
+              color:var(--text-muted);line-height:1.4;margin:0">
+   [ _ _ ]
+  ( o . o )   &lt;-- болит голова
+   \  ^  /
+    |||||
+    |||||
+  </pre>
+
+  <p style="margin-top:1.5rem;color:var(--text-muted);font-size:.9rem">
+    Если вы администратор — <a href="{{ url_for('login') }}">войдите в систему</a>.
+  </p>
+  <p style="color:var(--text-muted);font-size:.8rem;margin-top:.4rem">
+    Код ошибки: ROBOT_DOWN_503
+  </p>
+</div>
+""")
+
+
+# ===== ШАБЛОНЫ СТРАНИЦ =====
 INDEX_TPL = tpl("""
 <h1>Все статьи</h1>
 <form method="get" action="{{ url_for('index') }}">
@@ -1293,9 +1346,15 @@ def inject_user():
     role = None
     unread_count = 0
     if "user" in session:
-        me = q("SELECT * FROM users WHERE username=%s", (session["user"],), fetch="one")
+        try:
+            me = q("SELECT * FROM users WHERE username=%s", (session["user"],), fetch="one")
+        except Exception:
+            me = None
         if me:
-            role = get_role(None, me["role_id"])
+            try:
+                role = get_role(None, me["role_id"])
+            except Exception:
+                role = None
             try:
                 row = q("SELECT COUNT(*) AS c FROM private_messages WHERE recipient=%s AND is_read=0",
                         (session["user"],), fetch="one")
@@ -1475,8 +1534,11 @@ def upload_image():
 # ===== АУТЕНТИФИКАЦИЯ =====
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    row = q("SELECT COUNT(*) AS c FROM users", fetch="one")
-    users_count = row["c"] if row else 0
+    try:
+        row = q("SELECT COUNT(*) AS c FROM users", fetch="one")
+        users_count = row["c"] if row else 0
+    except Exception:
+        users_count = 0
     if users_count == 0:
         return redirect(url_for("setup"))
 
@@ -1498,8 +1560,11 @@ def login():
 
 @app.route("/setup", methods=["GET", "POST"])
 def setup():
-    row = q("SELECT COUNT(*) AS c FROM users", fetch="one")
-    users_count = row["c"] if row else 0
+    try:
+        row = q("SELECT COUNT(*) AS c FROM users", fetch="one")
+        users_count = row["c"] if row else 0
+    except Exception:
+        users_count = 0
     if users_count > 0:
         return redirect(url_for("login"))
 
@@ -1956,7 +2021,11 @@ def chat_delete(mid):
 
 
 # ===== ИНИЦИАЛИЗАЦИЯ =====
-init_db()
+try:
+    init_db()
+except Exception as e:
+    print("init_db error:", e, flush=True)
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
