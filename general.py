@@ -1,4 +1,3 @@
-import sqlite3
 import os
 import re
 import html
@@ -9,21 +8,23 @@ from functools import wraps
 from flask import (Flask, request, session, redirect, url_for,
                    render_template_string, g, abort, send_from_directory,
                    flash, jsonify)
+import psycopg2
+import psycopg2.extras
 
 # ===== НАСТРОЙКИ =====
 SECRET_KEY = os.environ.get("SECRET_KEY") or "temp-key-for-local-dev"
-DB_PATH = os.environ.get("DB_PATH", "wiki.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploads")
 ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
-MAX_AVATAR_BYTES = 2 * 1024 * 1024       # 2 МБ для аватаров
-MAX_IMG_BYTES = 5 * 1024 * 1024          # 5 МБ для картинок в статьях
-ONLINE_TIMEOUT_SEC = 300                  # 5 минут
+MAX_AVATAR_BYTES = 2 * 1024 * 1024
+MAX_IMG_BYTES = 5 * 1024 * 1024
+ONLINE_TIMEOUT_SEC = 300
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 МБ на запрос
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 
 # ===== ПРАВА =====
@@ -40,24 +41,67 @@ PERMS = {
 }
 
 
-# ===== БАЗА =====
+# ===== ПОДКЛЮЧЕНИЕ К POSTGRESQL =====
+def _clean_dsn(url: str) -> str:
+    """Убираем параметры, которые ломают подключение к внутренней БД RelaxDev."""
+    if not url:
+        return url
+    # убираем sslmode=require и channel_binding, добавляем sslmode=disable
+    url = re.sub(r"[?&]sslmode=[^&]*", "", url)
+    url = re.sub(r"[?&]channel_binding=[^&]*", "", url)
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}sslmode=disable"
+
+DSN = _clean_dsn(DATABASE_URL)
+
+
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        g.db = psycopg2.connect(DSN, cursor_factory=psycopg2.extras.RealDictCursor)
+        g.db.autocommit = False
     return g.db
 
 @app.teardown_appcontext
 def close_db(exc):
     db = g.pop("db", None)
     if db is not None:
-        db.close()
+        try:
+            if exc is None:
+                db.commit()
+            else:
+                db.rollback()
+        finally:
+            db.close()
 
+
+def q(sql, params=None, fetch=None):
+    """Универсальный хелпер для запросов.
+    fetch: None (просто выполнить), 'one', 'all'.
+    """
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(sql, params or ())
+    result = None
+    if fetch == "one":
+        result = cur.fetchone()
+    elif fetch == "all":
+        result = cur.fetchall()
+    cur.close()
+    return result
+
+
+def commit():
+    get_db().commit()
+
+
+# ===== ИНИЦИАЛИЗАЦИЯ СХЕМЫ =====
 def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.executescript("""
+    db = psycopg2.connect(DSN)
+    db.autocommit = True
+    cur = db.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             avatar TEXT DEFAULT '',
@@ -68,8 +112,10 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS pages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             slug TEXT UNIQUE NOT NULL,
             title TEXT NOT NULL,
             content TEXT NOT NULL,
@@ -77,20 +123,26 @@ def init_db():
             author TEXT NOT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             author TEXT NOT NULL,
             body TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS private_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             sender TEXT NOT NULL,
             recipient TEXT NOT NULL,
             body TEXT NOT NULL,
             is_read INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS invites (
             token TEXT PRIMARY KEY,
             created_by TEXT NOT NULL,
@@ -98,45 +150,17 @@ def init_db():
             role_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS roles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT UNIQUE NOT NULL,
             color TEXT DEFAULT '#3b82f6',
             perms TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    db.commit()
-    db.close()
-
-def migrate_db():
-    db = sqlite3.connect(DB_PATH)
-    def table_exists(t):
-        return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                          (t,)).fetchone() is not None
-    def cols(t):
-        return [r[1] for r in db.execute(f"PRAGMA table_info({t})").fetchall()]
-
-    if table_exists("users"):
-        uc = cols("users")
-        for name, ddl in [
-            ("avatar",     "ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT ''"),
-            ("bio",        "ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''"),
-            ("status",     "ALTER TABLE users ADD COLUMN status TEXT DEFAULT ''"),
-            ("is_owner",   "ALTER TABLE users ADD COLUMN is_owner INTEGER DEFAULT 0"),
-            ("role_id",    "ALTER TABLE users ADD COLUMN role_id INTEGER"),
-            ("created_at", "ALTER TABLE users ADD COLUMN created_at TIMESTAMP"),
-            ("last_seen",  "ALTER TABLE users ADD COLUMN last_seen TIMESTAMP"),
-        ]:
-            if name not in uc:
-                db.execute(ddl)
-        db.execute("UPDATE users SET is_owner=1 WHERE id=(SELECT MIN(id) FROM users)")
-        db.execute("UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE last_seen IS NULL")
-    if table_exists("pages") and "tags" not in cols("pages"):
-        db.execute("ALTER TABLE pages ADD COLUMN tags TEXT DEFAULT ''")
-    if table_exists("invites") and "role_id" not in cols("invites"):
-        db.execute("ALTER TABLE invites ADD COLUMN role_id INTEGER")
-    db.commit()
+    cur.close()
     db.close()
 
 
@@ -160,7 +184,7 @@ def verify_password(pw: str, stored: str) -> bool:
 def get_role(db, role_id):
     if not role_id:
         return None
-    return db.execute("SELECT * FROM roles WHERE id=?", (role_id,)).fetchone()
+    return q("SELECT * FROM roles WHERE id=%s", (role_id,), fetch="one")
 
 def role_perms(role):
     if not role:
@@ -172,36 +196,39 @@ def current_perms():
         return set(PERMS.keys())
     if "user" not in session:
         return set()
-    db = get_db()
-    u = db.execute("SELECT role_id FROM users WHERE username=?",
-                   (session["user"],)).fetchone()
+    u = q("SELECT role_id FROM users WHERE username=%s", (session["user"],), fetch="one")
     if not u:
         return set()
-    return role_perms(get_role(db, u["role_id"]))
+    return role_perms(get_role(None, u["role_id"]))
 
 def has_perm(perm: str) -> bool:
     return perm in current_perms()
 
 
 # ===== ОНЛАЙН-СТАТУС =====
-def is_online(last_seen_str):
-    if not last_seen_str:
+def is_online(last_seen):
+    if not last_seen:
         return False
-    try:
-        last = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
-        return False
+    if isinstance(last_seen, str):
+        try:
+            last = datetime.strptime(last_seen, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return False
+    else:
+        last = last_seen.replace(tzinfo=None) if hasattr(last_seen, "tzinfo") else last_seen
     return (datetime.utcnow() - last) < timedelta(seconds=ONLINE_TIMEOUT_SEC)
 
-def human_last_seen(last_seen_str):
-    if not last_seen_str:
+def human_last_seen(last_seen):
+    if not last_seen:
         return "неизвестно"
-    try:
-        last = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
-        return "неизвестно"
-    delta = datetime.utcnow() - last
-    secs = int(delta.total_seconds())
+    if isinstance(last_seen, str):
+        try:
+            last = datetime.strptime(last_seen, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return "неизвестно"
+    else:
+        last = last_seen.replace(tzinfo=None) if hasattr(last_seen, "tzinfo") else last_seen
+    secs = int((datetime.utcnow() - last).total_seconds())
     if secs < ONLINE_TIMEOUT_SEC:
         return "в сети"
     if secs < 3600:
@@ -248,12 +275,11 @@ def perm_required(perm: str):
 def update_last_seen():
     if "user" in session:
         try:
-            db = get_db()
-            db.execute("UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE username=?",
-                       (session["user"],))
-            db.commit()
+            q("UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE username=%s",
+              (session["user"],))
+            commit()
         except Exception:
-            pass
+            get_db().rollback()
 
 
 # ===== БАЗОВЫЙ ШАБЛОН =====
@@ -567,7 +593,7 @@ EDIT_TPL = tpl("""
 
   <label>Содержимое
     <span class="muted" style="font-weight:400">
-      (поддерживаются # ## ### для заголовков и ![alt](/uploads/...jpg) для картинок)
+      (# ## ### — заголовки; ![alt](/uploads/...jpg) — картинки)
     </span>
   </label>
 
@@ -1267,16 +1293,14 @@ def inject_user():
     role = None
     unread_count = 0
     if "user" in session:
-        db = get_db()
-        me = db.execute("SELECT * FROM users WHERE username=?",
-                        (session["user"],)).fetchone()
+        me = q("SELECT * FROM users WHERE username=%s", (session["user"],), fetch="one")
         if me:
-            role = get_role(db, me["role_id"])
+            role = get_role(None, me["role_id"])
             try:
-                unread_count = db.execute(
-                    "SELECT COUNT(*) c FROM private_messages WHERE recipient=? AND is_read=0",
-                    (session["user"],)).fetchone()["c"]
-            except sqlite3.OperationalError:
+                row = q("SELECT COUNT(*) AS c FROM private_messages WHERE recipient=%s AND is_read=0",
+                        (session["user"],), fetch="one")
+                unread_count = row["c"] if row else 0
+            except Exception:
                 unread_count = 0
     return {
         "me": me,
@@ -1307,7 +1331,6 @@ def render_content(text: str) -> str:
         if line.strip() == "":
             out.append("<br>")
             continue
-
         safe = html.escape(line)
         def repl(m):
             alt, url = m.group(1), m.group(2)
@@ -1319,78 +1342,68 @@ def render_content(text: str) -> str:
     return "\n".join(out)
 
 
-# ===== АВАТАРЫ И КАРТИНКИ =====
+# ===== ФАЙЛЫ =====
 @app.route("/uploads/<filename>")
 def uploaded_file(filename):
     if "/" in filename or "\\" in filename or filename.startswith("."):
         abort(404)
     return send_from_directory(UPLOAD_DIR, filename)
 
-def save_avatar(file_storage, username: str):
+def save_file(file_storage, prefix, max_bytes):
     if not file_storage or not file_storage.filename:
         return None
     ext = file_storage.filename.rsplit(".", 1)[-1].lower()
     if ext not in ALLOWED_EXT:
         return None
     data = file_storage.read()
-    if len(data) > MAX_AVATAR_BYTES:
+    if len(data) > max_bytes:
         return None
-    name = f"{username}_{secrets.token_hex(6)}.{ext}"
+    name = f"{prefix}_{secrets.token_hex(6)}.{ext}"
     with open(os.path.join(UPLOAD_DIR, name), "wb") as f:
         f.write(data)
     return name
 
+def save_avatar(file_storage, username):
+    return save_file(file_storage, username, MAX_AVATAR_BYTES)
+
 def save_article_image(file_storage):
-    if not file_storage or not file_storage.filename:
-        return None
-    ext = file_storage.filename.rsplit(".", 1)[-1].lower()
-    if ext not in ALLOWED_EXT:
-        return None
-    data = file_storage.read()
-    if len(data) > MAX_IMG_BYTES:
-        return None
-    name = f"img_{secrets.token_hex(8)}.{ext}"
-    with open(os.path.join(UPLOAD_DIR, name), "wb") as f:
-        f.write(data)
-    return name
+    return save_file(file_storage, "img", MAX_IMG_BYTES)
 
 
 # ===== СТАТЬИ =====
 @app.route("/")
 @login_required
 def index():
-    q = request.args.get("q", "").strip()
+    search = request.args.get("q", "").strip()
     tag = request.args.get("tag", "").strip()
-    db = get_db()
     sql = "SELECT * FROM pages"
     params = []
     where = []
-    if q:
-        where.append("(title LIKE ? OR content LIKE ?)")
-        params += [f"%{q}%", f"%{q}%"]
+    if search:
+        where.append("(title ILIKE %s OR content ILIKE %s)")
+        params += [f"%{search}%", f"%{search}%"]
     if tag:
-        where.append("(',' || tags || ',') LIKE ?")
+        where.append("(',' || tags || ',') LIKE %s")
         params.append(f"%,{tag},%")
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY title"
-    pages = db.execute(sql, params).fetchall()
+    pages = q(sql, params, fetch="all") or []
 
     tags_set = set()
-    for r in db.execute("SELECT tags FROM pages").fetchall():
+    for r in q("SELECT tags FROM pages", fetch="all") or []:
         for t in (r["tags"] or "").split(","):
             t = t.strip()
             if t:
                 tags_set.add(t)
-    return render_template_string(INDEX_TPL, pages=pages, q=q,
+    return render_template_string(INDEX_TPL, pages=pages, q=search,
                                   all_tags=sorted(tags_set))
 
 
 @app.route("/page/<slug>")
 @login_required
 def view_page(slug):
-    db = get_db()
-    page = db.execute("SELECT * FROM pages WHERE slug=?", (slug,)).fetchone()
+    page = q("SELECT * FROM pages WHERE slug=%s", (slug,), fetch="one")
     if not page:
         abort(404)
     return render_template_string(VIEW_TPL, page=page,
@@ -1405,13 +1418,12 @@ def new_page():
         slug = request.form["slug"].strip().lower()
         tags = request.form.get("tags", "").strip()
         content = request.form["content"]
-        db = get_db()
         try:
-            db.execute(
-                "INSERT INTO pages (slug, title, content, tags, author) VALUES (?,?,?,?,?)",
-                (slug, title, content, tags, session["user"]))
-            db.commit()
-        except sqlite3.IntegrityError:
+            q("INSERT INTO pages (slug, title, content, tags, author) VALUES (%s,%s,%s,%s,%s)",
+              (slug, title, content, tags, session["user"]))
+            commit()
+        except psycopg2.IntegrityError:
+            get_db().rollback()
             flash("Такой slug уже существует")
             return render_template_string(EDIT_TPL, page=None), 400
         return redirect(url_for("view_page", slug=slug))
@@ -1421,8 +1433,7 @@ def new_page():
 @app.route("/edit/<slug>", methods=["GET", "POST"])
 @login_required
 def edit_page(slug):
-    db = get_db()
-    page = db.execute("SELECT * FROM pages WHERE slug=?", (slug,)).fetchone()
+    page = q("SELECT * FROM pages WHERE slug=%s", (slug,), fetch="one")
     if not page:
         abort(404)
     if not (has_perm("edit_any") or
@@ -1433,11 +1444,10 @@ def edit_page(slug):
         new_slug = request.form["slug"].strip().lower()
         tags = request.form.get("tags", "").strip()
         content = request.form["content"]
-        db.execute(
-            "UPDATE pages SET title=?, slug=?, content=?, tags=?, "
-            "updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (title, new_slug, content, tags, page["id"]))
-        db.commit()
+        q("UPDATE pages SET title=%s, slug=%s, content=%s, tags=%s, "
+          "updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+          (title, new_slug, content, tags, page["id"]))
+        commit()
         return redirect(url_for("view_page", slug=new_slug))
     return render_template_string(EDIT_TPL, page=page)
 
@@ -1445,9 +1455,8 @@ def edit_page(slug):
 @app.route("/delete/<slug>", methods=["POST"])
 @perm_required("delete_page")
 def delete_page(slug):
-    db = get_db()
-    db.execute("DELETE FROM pages WHERE slug=?", (slug,))
-    db.commit()
+    q("DELETE FROM pages WHERE slug=%s", (slug,))
+    commit()
     return redirect(url_for("index"))
 
 
@@ -1466,20 +1475,20 @@ def upload_image():
 # ===== АУТЕНТИФИКАЦИЯ =====
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    db = get_db()
-    users_count = db.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    row = q("SELECT COUNT(*) AS c FROM users", fetch="one")
+    users_count = row["c"] if row else 0
     if users_count == 0:
         return redirect(url_for("setup"))
 
     if request.method == "POST":
         username = request.form["username"].strip()
         password = request.form["password"]
-        user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        user = q("SELECT * FROM users WHERE username=%s", (username,), fetch="one")
         if user and verify_password(password, user["password"]):
             session["user"] = username
             session["is_owner"] = bool(user["is_owner"])
-            db.execute("UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE username=?", (username,))
-            db.commit()
+            q("UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE username=%s", (username,))
+            commit()
             nxt = request.args.get("next") or url_for("index")
             return redirect(nxt)
         flash("Неверный логин или пароль")
@@ -1489,8 +1498,8 @@ def login():
 
 @app.route("/setup", methods=["GET", "POST"])
 def setup():
-    db = get_db()
-    users_count = db.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    row = q("SELECT COUNT(*) AS c FROM users", fetch="one")
+    users_count = row["c"] if row else 0
     if users_count > 0:
         return redirect(url_for("login"))
 
@@ -1500,9 +1509,9 @@ def setup():
         if len(username) < 3 or len(password) < 4:
             flash("Логин ≥3 символов, пароль ≥4")
             return render_template_string(SETUP_TPL), 400
-        db.execute("INSERT INTO users (username, password, is_owner) VALUES (?, ?, 1)",
-                   (username, hash_password(password)))
-        db.commit()
+        q("INSERT INTO users (username, password, is_owner) VALUES (%s, %s, 1)",
+          (username, hash_password(password)))
+        commit()
         session["user"] = username
         session["is_owner"] = True
         return redirect(url_for("index"))
@@ -1516,9 +1525,8 @@ def register_info():
 
 @app.route("/invite/<token>", methods=["GET", "POST"])
 def invite(token):
-    db = get_db()
-    inv = db.execute("SELECT * FROM invites WHERE token=? AND used_by IS NULL",
-                     (token,)).fetchone()
+    inv = q("SELECT * FROM invites WHERE token=%s AND used_by IS NULL",
+            (token,), fetch="one")
     if not inv:
         return "Приглашение недействительно или уже использовано", 410
 
@@ -1529,11 +1537,12 @@ def invite(token):
             flash("Логин ≥3 символов, пароль ≥4")
             return render_template_string(INVITE_TPL), 400
         try:
-            db.execute("INSERT INTO users (username, password, is_owner, role_id) VALUES (?, ?, 0, ?)",
-                       (username, hash_password(password), inv["role_id"]))
-            db.execute("UPDATE invites SET used_by=? WHERE token=?", (username, token))
-            db.commit()
-        except sqlite3.IntegrityError:
+            q("INSERT INTO users (username, password, is_owner, role_id) VALUES (%s, %s, 0, %s)",
+              (username, hash_password(password), inv["role_id"]))
+            q("UPDATE invites SET used_by=%s WHERE token=%s", (username, token))
+            commit()
+        except psycopg2.IntegrityError:
+            get_db().rollback()
             flash("Такой логин уже занят")
             return render_template_string(INVITE_TPL), 400
         session["user"] = username
@@ -1548,63 +1557,56 @@ def logout():
     return redirect(url_for("login"))
 
 
-# ===== ПУБЛИЧНЫЙ ПРОФИЛЬ =====
+# ===== ПРОФИЛЬ =====
 @app.route("/user/<username>")
 @login_required
 def user_profile(username):
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    user = q("SELECT * FROM users WHERE username=%s", (username,), fetch="one")
     if not user:
         abort(404)
-    role = get_role(db, user["role_id"])
-    pages_count = db.execute("SELECT COUNT(*) c FROM pages WHERE author=?", (username,)).fetchone()["c"]
-    chat_count = db.execute("SELECT COUNT(*) c FROM messages WHERE author=?", (username,)).fetchone()["c"]
-    online = is_online(user["last_seen"])
-    last_seen_text = human_last_seen(user["last_seen"])
+    role = get_role(None, user["role_id"])
+    pages_count = (q("SELECT COUNT(*) AS c FROM pages WHERE author=%s",
+                     (username,), fetch="one") or {}).get("c", 0)
+    chat_count = (q("SELECT COUNT(*) AS c FROM messages WHERE author=%s",
+                    (username,), fetch="one") or {}).get("c", 0)
     return render_template_string(USER_PROFILE_TPL, user=user, role=role,
                                   pages_count=pages_count, chat_count=chat_count,
-                                  online=online, last_seen_text=last_seen_text)
+                                  online=is_online(user["last_seen"]),
+                                  last_seen_text=human_last_seen(user["last_seen"]))
 
 
 @app.route("/profile/edit", methods=["POST"])
 @login_required
 def update_profile():
-    db = get_db()
     status = request.form.get("status", "").strip()[:100]
     bio = request.form.get("bio", "").strip()[:500]
-    db.execute("UPDATE users SET status=?, bio=? WHERE username=?",
-               (status, bio, session["user"]))
-    db.commit()
+    q("UPDATE users SET status=%s, bio=%s WHERE username=%s",
+      (status, bio, session["user"]))
+    commit()
     flash("Профиль обновлён")
     return redirect(url_for("profile"))
 
 
-# ===== ЛИЧНЫЕ СООБЩЕНИЯ =====
+# ===== ЛИЧНЫЕ =====
 @app.route("/messages")
 @login_required
 def messages_inbox():
-    db = get_db()
     me = session["user"]
-    rows = db.execute("""
-        SELECT * FROM private_messages
-        WHERE sender=? OR recipient=?
-        ORDER BY id DESC
-    """, (me, me)).fetchall()
+    rows = q("""SELECT * FROM private_messages
+                WHERE sender=%s OR recipient=%s
+                ORDER BY id DESC""", (me, me), fetch="all") or []
     dialogs = {}
     for r in rows:
         other = r["recipient"] if r["sender"] == me else r["sender"]
         if other not in dialogs:
-            dialogs[other] = {
-                "other": other,
-                "last_body": r["body"],
-                "last_at": r["created_at"],
-                "unread": 0,
-            }
+            dialogs[other] = {"other": other, "last_body": r["body"],
+                              "last_at": r["created_at"], "unread": 0}
         if r["recipient"] == me and not r["is_read"]:
             dialogs[other]["unread"] += 1
     dialog_list = []
     for d in dialogs.values():
-        u = db.execute("SELECT avatar, last_seen FROM users WHERE username=?", (d["other"],)).fetchone()
+        u = q("SELECT avatar, last_seen FROM users WHERE username=%s",
+              (d["other"],), fetch="one")
         d["avatar"] = u["avatar"] if u else ""
         d["online"] = is_online(u["last_seen"]) if u else False
         d["last_seen_text"] = human_last_seen(u["last_seen"]) if u else "неизвестно"
@@ -1615,39 +1617,37 @@ def messages_inbox():
 @app.route("/messages/<username>", methods=["GET", "POST"])
 @login_required
 def messages_with(username):
-    db = get_db()
     if username == session["user"]:
         return redirect(url_for("messages_inbox"))
-    other = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    other = q("SELECT * FROM users WHERE username=%s", (username,), fetch="one")
     if not other:
         abort(404)
 
     if request.method == "POST":
         body = request.form.get("body", "").strip()
         if body:
-            db.execute("INSERT INTO private_messages (sender, recipient, body) VALUES (?,?,?)",
-                       (session["user"], username, body[:2000]))
-            db.commit()
+            q("INSERT INTO private_messages (sender, recipient, body) VALUES (%s,%s,%s)",
+              (session["user"], username, body[:2000]))
+            commit()
         return redirect(url_for("messages_with", username=username))
 
-    db.execute("UPDATE private_messages SET is_read=1 WHERE recipient=? AND sender=?",
-               (session["user"], username))
-    db.commit()
+    q("UPDATE private_messages SET is_read=1 WHERE recipient=%s AND sender=%s",
+      (session["user"], username))
+    commit()
 
-    messages = db.execute("""
-        SELECT * FROM private_messages
-        WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?)
-        ORDER BY id ASC LIMIT 500
-    """, (session["user"], username, username, session["user"])).fetchall()
-    online = is_online(other["last_seen"])
-    last_seen_text = human_last_seen(other["last_seen"])
+    messages = q("""SELECT * FROM private_messages
+                    WHERE (sender=%s AND recipient=%s) OR (sender=%s AND recipient=%s)
+                    ORDER BY id ASC LIMIT 500""",
+                 (session["user"], username, username, session["user"]),
+                 fetch="all") or []
     last_id = messages[-1]["id"] if messages else 0
     return render_template_string(MESSAGES_WITH_TPL, other=other, messages=messages,
-                                  online=online, last_seen_text=last_seen_text,
+                                  online=is_online(other["last_seen"]),
+                                  last_seen_text=human_last_seen(other["last_seen"]),
                                   last_id=last_id)
 
 
-# ===== API: ОБЩИЙ ЧАТ =====
+# ===== API ЧАТА =====
 @app.route("/chat/messages")
 @login_required
 def chat_messages_api():
@@ -1655,22 +1655,16 @@ def chat_messages_api():
         after = int(request.args.get("after", 0))
     except ValueError:
         after = 0
-    db = get_db()
-    rows = db.execute("""
-        SELECT m.id, m.author, m.body, m.created_at, u.avatar, u.last_seen
-        FROM messages m
-        LEFT JOIN users u ON u.username = m.author
-        WHERE m.id > ?
-        ORDER BY m.id ASC
-        LIMIT 200
-    """, (after,)).fetchall()
+    rows = q("""SELECT m.id, m.author, m.body, m.created_at, u.avatar, u.last_seen
+                FROM messages m
+                LEFT JOIN users u ON u.username = m.author
+                WHERE m.id > %s
+                ORDER BY m.id ASC LIMIT 200""", (after,), fetch="all") or []
     out = []
     for m in rows:
         out.append({
-            "id": m["id"],
-            "author": m["author"],
-            "body": m["body"],
-            "created_at": m["created_at"],
+            "id": m["id"], "author": m["author"], "body": m["body"],
+            "created_at": str(m["created_at"]),
             "avatar": m["avatar"] or "",
             "online": is_online(m["last_seen"]),
         })
@@ -1684,14 +1678,12 @@ def chat_send_ajax():
     body = (data.get("body") or "").strip()
     if not body:
         return jsonify({"ok": False, "error": "Пустое сообщение"}), 400
-    db = get_db()
-    cur = db.execute("INSERT INTO messages (author, body) VALUES (?, ?)",
-                     (session["user"], body[:2000]))
-    db.commit()
-    return jsonify({"ok": True, "id": cur.lastrowid})
+    q("INSERT INTO messages (author, body) VALUES (%s, %s)",
+      (session["user"], body[:2000]))
+    commit()
+    return jsonify({"ok": True})
 
 
-# ===== API: ЛИЧНЫЕ =====
 @app.route("/messages/<username>/api")
 @login_required
 def pm_messages_api(username):
@@ -1699,23 +1691,20 @@ def pm_messages_api(username):
         after = int(request.args.get("after", 0))
     except ValueError:
         after = 0
-    db = get_db()
-    rows = db.execute("""
-        SELECT * FROM private_messages
-        WHERE ((sender=? AND recipient=?) OR (sender=? AND recipient=?))
-          AND id > ?
-        ORDER BY id ASC LIMIT 500
-    """, (session["user"], username, username, session["user"], after)).fetchall()
-    db.execute("UPDATE private_messages SET is_read=1 WHERE recipient=? AND sender=?",
-               (session["user"], username))
-    db.commit()
+    rows = q("""SELECT * FROM private_messages
+                WHERE ((sender=%s AND recipient=%s) OR (sender=%s AND recipient=%s))
+                  AND id > %s
+                ORDER BY id ASC LIMIT 500""",
+             (session["user"], username, username, session["user"], after),
+             fetch="all") or []
+    q("UPDATE private_messages SET is_read=1 WHERE recipient=%s AND sender=%s",
+      (session["user"], username))
+    commit()
     out = []
     for m in rows:
         out.append({
-            "id": m["id"],
-            "sender": m["sender"],
-            "body": m["body"],
-            "created_at": m["created_at"],
+            "id": m["id"], "sender": m["sender"], "body": m["body"],
+            "created_at": str(m["created_at"]),
             "is_me": m["sender"] == session["user"],
         })
     return jsonify(out)
@@ -1728,14 +1717,13 @@ def pm_send_ajax(username):
     body = (data.get("body") or "").strip()
     if not body:
         return jsonify({"ok": False, "error": "Пустое сообщение"}), 400
-    db = get_db()
-    other = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+    other = q("SELECT id FROM users WHERE username=%s", (username,), fetch="one")
     if not other:
         return jsonify({"ok": False, "error": "Пользователь не найден"}), 404
-    cur = db.execute("INSERT INTO private_messages (sender, recipient, body) VALUES (?,?,?)",
-                     (session["user"], username, body[:2000]))
-    db.commit()
-    return jsonify({"ok": True, "id": cur.lastrowid})
+    q("INSERT INTO private_messages (sender, recipient, body) VALUES (%s,%s,%s)",
+      (session["user"], username, body[:2000]))
+    commit()
+    return jsonify({"ok": True})
 
 
 # ===== АДМИНКА =====
@@ -1745,22 +1733,21 @@ def admin_users():
     if not (session.get("is_owner") or has_perm("view_admin") or
             has_perm("manage_users") or has_perm("manage_roles")):
         abort(403)
-    db = get_db()
-    users_rows = db.execute("SELECT * FROM users ORDER BY id").fetchall()
+    users_rows = q("SELECT * FROM users ORDER BY id", fetch="all") or []
     users = []
     for u in users_rows:
         d = dict(u)
         d["online"] = is_online(u["last_seen"])
         d["last_seen_text"] = human_last_seen(u["last_seen"])
         users.append(d)
-    roles = db.execute("SELECT * FROM roles ORDER BY name").fetchall()
-    invites = db.execute("""
-        SELECT i.token, i.created_at, r.name AS role_name
-        FROM invites i LEFT JOIN roles r ON r.id = i.role_id
-        WHERE i.used_by IS NULL ORDER BY i.created_at DESC
-    """).fetchall()
+    roles = q("SELECT * FROM roles ORDER BY name", fetch="all") or []
+    invites = q("""SELECT i.token, i.created_at, r.name AS role_name
+                   FROM invites i LEFT JOIN roles r ON r.id = i.role_id
+                   WHERE i.used_by IS NULL ORDER BY i.created_at DESC""",
+                fetch="all") or []
     role_user_counts = {}
-    for row in db.execute("SELECT role_id, COUNT(*) c FROM users WHERE role_id IS NOT NULL GROUP BY role_id"):
+    for row in q("""SELECT role_id, COUNT(*) AS c FROM users
+                    WHERE role_id IS NOT NULL GROUP BY role_id""", fetch="all") or []:
         role_user_counts[row["role_id"]] = row["c"]
     return render_template_string(ADMIN_TPL, users=users, roles=roles,
                                   invites=invites, role_user_counts=role_user_counts,
@@ -1775,13 +1762,13 @@ def admin_create_role():
     if not name:
         flash("Название обязательно")
         return redirect(url_for("admin_users"))
-    db = get_db()
     try:
-        cur = db.execute("INSERT INTO roles (name, color, perms) VALUES (?, ?, '')",
-                         (name, color))
-        db.commit()
-        return redirect(url_for("admin_edit_role", rid=cur.lastrowid))
-    except sqlite3.IntegrityError:
+        row = q("INSERT INTO roles (name, color, perms) VALUES (%s, %s, '') RETURNING id",
+                (name, color), fetch="one")
+        commit()
+        return redirect(url_for("admin_edit_role", rid=row["id"]))
+    except psycopg2.IntegrityError:
+        get_db().rollback()
         flash("Роль с таким названием уже есть")
         return redirect(url_for("admin_users"))
 
@@ -1789,8 +1776,7 @@ def admin_create_role():
 @app.route("/admin/roles/<int:rid>", methods=["GET", "POST"])
 @perm_required("manage_roles")
 def admin_edit_role(rid):
-    db = get_db()
-    role = db.execute("SELECT * FROM roles WHERE id=?", (rid,)).fetchone()
+    role = q("SELECT * FROM roles WHERE id=%s", (rid,), fetch="one")
     if not role:
         abort(404)
     if request.method == "POST":
@@ -1799,11 +1785,12 @@ def admin_edit_role(rid):
         picked = request.form.getlist("perm")
         valid = [p for p in picked if p in PERMS]
         try:
-            db.execute("UPDATE roles SET name=?, color=?, perms=? WHERE id=?",
-                       (name, color, ",".join(valid), rid))
-            db.commit()
+            q("UPDATE roles SET name=%s, color=%s, perms=%s WHERE id=%s",
+              (name, color, ",".join(valid), rid))
+            commit()
             flash("Роль сохранена")
-        except sqlite3.IntegrityError:
+        except psycopg2.IntegrityError:
+            get_db().rollback()
             flash("Роль с таким названием уже есть")
         return redirect(url_for("admin_users"))
     current = set(p for p in (role["perms"] or "").split(",") if p)
@@ -1813,10 +1800,9 @@ def admin_edit_role(rid):
 @app.route("/admin/roles/<int:rid>/delete", methods=["POST"])
 @perm_required("manage_roles")
 def admin_delete_role(rid):
-    db = get_db()
-    db.execute("UPDATE users SET role_id=NULL WHERE role_id=? AND is_owner=0", (rid,))
-    db.execute("DELETE FROM roles WHERE id=?", (rid,))
-    db.commit()
+    q("UPDATE users SET role_id=NULL WHERE role_id=%s AND is_owner=0", (rid,))
+    q("DELETE FROM roles WHERE id=%s", (rid,))
+    commit()
     flash("Роль удалена")
     return redirect(url_for("admin_users"))
 
@@ -1825,20 +1811,19 @@ def admin_delete_role(rid):
 @perm_required("manage_users")
 def admin_set_role(uid):
     rid = request.form.get("role_id") or None
-    db = get_db()
-    u = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    u = q("SELECT * FROM users WHERE id=%s", (uid,), fetch="one")
     if not u:
         abort(404)
     if u["is_owner"]:
         flash("Нельзя менять роль владельца")
         return redirect(url_for("admin_users"))
     if rid:
-        r = db.execute("SELECT id FROM roles WHERE id=?", (rid,)).fetchone()
+        r = q("SELECT id FROM roles WHERE id=%s", (rid,), fetch="one")
         if not r:
             flash("Роль не найдена")
             return redirect(url_for("admin_users"))
-    db.execute("UPDATE users SET role_id=? WHERE id=?", (rid, uid))
-    db.commit()
+    q("UPDATE users SET role_id=%s WHERE id=%s", (rid, uid))
+    commit()
     flash(f"Роль пользователя «{u['username']}» обновлена")
     return redirect(url_for("admin_users"))
 
@@ -1852,13 +1837,13 @@ def admin_create_user():
     if len(username) < 3 or len(password) < 4:
         flash("Логин ≥3 и пароль ≥4 символов")
         return redirect(url_for("admin_users"))
-    db = get_db()
     try:
-        db.execute("INSERT INTO users (username, password, is_owner, role_id) VALUES (?, ?, 0, ?)",
-                   (username, hash_password(password), role_id))
-        db.commit()
+        q("INSERT INTO users (username, password, is_owner, role_id) VALUES (%s, %s, 0, %s)",
+          (username, hash_password(password), role_id))
+        commit()
         flash(f"Пользователь «{username}» создан")
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        get_db().rollback()
         flash("Такой логин уже занят")
     return redirect(url_for("admin_users"))
 
@@ -1866,15 +1851,14 @@ def admin_create_user():
 @app.route("/admin/users/<int:uid>/delete", methods=["POST"])
 @perm_required("manage_users")
 def admin_delete_user(uid):
-    db = get_db()
-    u = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    u = q("SELECT * FROM users WHERE id=%s", (uid,), fetch="one")
     if not u:
         abort(404)
     if u["is_owner"]:
         flash("Нельзя удалить владельца")
         return redirect(url_for("admin_users"))
-    db.execute("DELETE FROM users WHERE id=?", (uid,))
-    db.commit()
+    q("DELETE FROM users WHERE id=%s", (uid,))
+    commit()
     flash(f"Пользователь «{u['username']}» удалён")
     return redirect(url_for("admin_users"))
 
@@ -1884,10 +1868,9 @@ def admin_delete_user(uid):
 def admin_create_invite():
     role_id = request.form.get("role_id") or None
     token = secrets.token_urlsafe(24)
-    db = get_db()
-    db.execute("INSERT INTO invites (token, created_by, role_id) VALUES (?, ?, ?)",
-               (token, session["user"], role_id))
-    db.commit()
+    q("INSERT INTO invites (token, created_by, role_id) VALUES (%s, %s, %s)",
+      (token, session["user"], role_id))
+    commit()
     session["last_invite"] = f"{request.host_url.rstrip('/')}/invite/{token}"
     return redirect(url_for("admin_users"))
 
@@ -1896,21 +1879,19 @@ def admin_create_invite():
 @app.route("/profile", methods=["GET", "POST"])
 @login_required
 def profile():
-    db = get_db()
     if request.method == "POST":
         f = request.files.get("avatar")
         name = save_avatar(f, session["user"])
         if not name:
             flash("Не удалось загрузить: проверь формат и размер")
             return redirect(url_for("profile"))
-        old = db.execute("SELECT avatar FROM users WHERE username=?",
-                         (session["user"],)).fetchone()["avatar"]
+        old = q("SELECT avatar FROM users WHERE username=%s",
+                (session["user"],), fetch="one")["avatar"]
         if old:
             try: os.remove(os.path.join(UPLOAD_DIR, old))
             except OSError: pass
-        db.execute("UPDATE users SET avatar=? WHERE username=?",
-                   (name, session["user"]))
-        db.commit()
+        q("UPDATE users SET avatar=%s WHERE username=%s", (name, session["user"]))
+        commit()
         flash("Аватар обновлён")
         return redirect(url_for("profile"))
     return render_template_string(PROFILE_TPL)
@@ -1919,14 +1900,13 @@ def profile():
 @app.route("/profile/avatar/remove", methods=["POST"])
 @login_required
 def remove_avatar():
-    db = get_db()
-    old = db.execute("SELECT avatar FROM users WHERE username=?",
-                     (session["user"],)).fetchone()["avatar"]
+    old = q("SELECT avatar FROM users WHERE username=%s",
+            (session["user"],), fetch="one")["avatar"]
     if old:
         try: os.remove(os.path.join(UPLOAD_DIR, old))
         except OSError: pass
-    db.execute("UPDATE users SET avatar='' WHERE username=?", (session["user"],))
-    db.commit()
+    q("UPDATE users SET avatar='' WHERE username=%s", (session["user"],))
+    commit()
     flash("Аватар удалён")
     return redirect(url_for("profile"))
 
@@ -1937,18 +1917,15 @@ def change_password():
     old = request.form["old"]
     new1 = request.form["new1"]
     new2 = request.form["new2"]
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE username=?",
-                      (session["user"],)).fetchone()
+    user = q("SELECT * FROM users WHERE username=%s", (session["user"],), fetch="one")
     if not verify_password(old, user["password"]):
         flash("Текущий пароль неверный")
         return redirect(url_for("profile"))
     if new1 != new2 or len(new1) < 4:
         flash("Пароли не совпадают или слишком короткие")
         return redirect(url_for("profile"))
-    db.execute("UPDATE users SET password=? WHERE id=?",
-               (hash_password(new1), user["id"]))
-    db.commit()
+    q("UPDATE users SET password=%s WHERE id=%s", (hash_password(new1), user["id"]))
+    commit()
     flash("Пароль изменён")
     return redirect(url_for("profile"))
 
@@ -1957,13 +1934,10 @@ def change_password():
 @app.route("/chat")
 @login_required
 def chat():
-    db = get_db()
-    rows = db.execute("""
-        SELECT m.*, u.avatar AS avatar, u.last_seen AS last_seen
-        FROM messages m
-        LEFT JOIN users u ON u.username = m.author
-        ORDER BY m.id DESC LIMIT 200
-    """).fetchall()
+    rows = q("""SELECT m.*, u.avatar AS avatar, u.last_seen AS last_seen
+                FROM messages m
+                LEFT JOIN users u ON u.username = m.author
+                ORDER BY m.id DESC LIMIT 200""", fetch="all") or []
     msgs = []
     for m in reversed(rows):
         d = dict(m)
@@ -1976,15 +1950,13 @@ def chat():
 @app.route("/chat/delete/<int:mid>", methods=["POST"])
 @perm_required("chat_delete")
 def chat_delete(mid):
-    db = get_db()
-    db.execute("DELETE FROM messages WHERE id=?", (mid,))
-    db.commit()
+    q("DELETE FROM messages WHERE id=%s", (mid,))
+    commit()
     return redirect(url_for("chat"))
 
 
 # ===== ИНИЦИАЛИЗАЦИЯ =====
 init_db()
-migrate_db()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
